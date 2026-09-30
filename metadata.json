@@ -1,0 +1,6 @@
+{
+  "name": "InkForge — AI-Enhanced Handwriting Notebook",
+  "description": "Cross-platform local-first digital ink notebook designed for graphics tablets with low-latency rendering, modular C++20/Qt 6 architecture, and vector stroke modeling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,8 @@
+add_subdirectory(ink)
+add_subdirectory(input)
+add_subdirectory(documents)
+add_subdirectory(rendering)
+add_subdirectory(commands)
+add_subdirectory(storage)
+add_subdirectory(canvas)
+add_subdirectory(app)
