@@ -1,5 +1,6 @@
 import React from 'react';
-import { HistoryManager } from '../utils/historyManager';
+import { PageHistoryManager, CommandType } from '../utils/historyManager';
+import { PageData } from '../types/inkforge';
 import {
   Undo2,
   Redo2,
@@ -8,21 +9,25 @@ import {
   Clock,
   Pen,
   Eraser,
+  Type,
+  Move,
   RotateCcw,
   Sparkles,
   X,
 } from 'lucide-react';
 
 interface HistoryTimelineProps {
-  historyManager: HistoryManager;
+  historyManager: PageHistoryManager;
   isOpen: boolean;
   onClose: () => void;
+  onApplyToPage: (transform: (prev: PageData) => PageData) => void;
 }
 
 export const HistoryTimeline: React.FC<HistoryTimelineProps> = ({
   historyManager,
   isOpen,
   onClose,
+  onApplyToPage,
 }) => {
   if (!isOpen) return null;
 
@@ -32,15 +37,23 @@ export const HistoryTimeline: React.FC<HistoryTimelineProps> = ({
   const canUndo = historyManager.canUndo();
   const canRedo = historyManager.canRedo();
 
-  const getCommandIcon = (type: string) => {
+  const getCommandIcon = (type: CommandType) => {
     switch (type) {
       case 'add_stroke':
-        return <Pen className="w-3.5 h-3.5 text-neutral-300" />;
+        return <Pen className="w-3.5 h-3.5 text-indigo-400" />;
       case 'batch_erase':
       case 'erase_stroke':
-        return <Eraser className="w-3.5 h-3.5 text-neutral-400" />;
-      case 'clear_canvas':
-        return <Trash2 className="w-3.5 h-3.5 text-neutral-400" />;
+        return <Eraser className="w-3.5 h-3.5 text-amber-400" />;
+      case 'clear_ink':
+        return <Trash2 className="w-3.5 h-3.5 text-rose-400" />;
+      case 'add_text':
+      case 'edit_text':
+        return <Type className="w-3.5 h-3.5 text-emerald-400" />;
+      case 'move_text':
+      case 'resize_text':
+        return <Move className="w-3.5 h-3.5 text-sky-400" />;
+      case 'delete_text':
+        return <Trash2 className="w-3.5 h-3.5 text-orange-400" />;
       default:
         return <Sparkles className="w-3.5 h-3.5 text-neutral-400" />;
     }
@@ -55,11 +68,11 @@ export const HistoryTimeline: React.FC<HistoryTimelineProps> = ({
   };
 
   return (
-    <aside className="w-72 border-l border-neutral-800 bg-neutral-950 flex flex-col z-30 shrink-0 select-none shadow-xl">
+    <aside className="w-72 border-l border-neutral-200 bg-white flex flex-col z-30 shrink-0 select-none shadow-lg text-neutral-800 text-xs">
       {/* Header */}
-      <div className="h-11 border-b border-neutral-800 px-3 flex items-center justify-between">
+      <div className="h-11 border-b border-neutral-200 px-3 flex items-center justify-between bg-neutral-50">
         <div className="flex items-center gap-2">
-          <span className="text-xs font-semibold text-neutral-200">History</span>
+          <span className="font-semibold text-neutral-900">Page History</span>
           <span className="text-[11px] font-mono text-neutral-500">
             {undoCount} undo · {redoCount} redo
           </span>
@@ -67,25 +80,28 @@ export const HistoryTimeline: React.FC<HistoryTimelineProps> = ({
 
         <div className="flex items-center gap-1">
           <button
-            onClick={() => historyManager.undo()}
+            onClick={() => historyManager.undo(onApplyToPage)}
             disabled={!canUndo}
-            className="p-1 rounded text-neutral-400 hover:text-white disabled:opacity-20"
+            className="p-1 rounded text-neutral-500 hover:text-neutral-900 disabled:opacity-20 hover:bg-neutral-200/60 transition-colors"
             title="Undo (Ctrl+Z)"
+            aria-label="Undo"
           >
             <Undo2 className="w-3.5 h-3.5" />
           </button>
           <button
-            onClick={() => historyManager.redo()}
+            onClick={() => historyManager.redo(onApplyToPage)}
             disabled={!canRedo}
-            className="p-1 rounded text-neutral-400 hover:text-white disabled:opacity-20"
+            className="p-1 rounded text-neutral-500 hover:text-neutral-900 disabled:opacity-20 hover:bg-neutral-200/60 transition-colors"
             title="Redo (Ctrl+Y)"
+            aria-label="Redo"
           >
             <Redo2 className="w-3.5 h-3.5" />
           </button>
           <button
             onClick={onClose}
-            className="p-1 rounded text-neutral-500 hover:text-neutral-200 ml-1"
-            title="Close Panel"
+            className="p-1 rounded text-neutral-400 hover:text-neutral-700 ml-1 hover:bg-neutral-200/60 transition-colors"
+            title="Close history panel"
+            aria-label="Close history panel"
           >
             <X className="w-3.5 h-3.5" />
           </button>
@@ -95,25 +111,26 @@ export const HistoryTimeline: React.FC<HistoryTimelineProps> = ({
       {/* Timeline List */}
       <div className="flex-1 overflow-y-auto p-2 space-y-1">
         {timeline.length === 0 ? (
-          <div className="py-12 text-center text-xs text-neutral-500 flex flex-col items-center justify-center gap-2">
-            <Clock className="w-5 h-5 text-neutral-600" />
-            <p>No strokes yet</p>
+          <div className="py-12 text-center text-xs text-neutral-400 flex flex-col items-center justify-center gap-2">
+            <Clock className="w-5 h-5 text-neutral-300" />
+            <p>No actions on this page yet.</p>
+            <p className="text-[10px] text-neutral-400">Draw or type to generate page history.</p>
           </div>
         ) : (
           <>
             <button
-              onClick={() => historyManager.jumpToStep(0)}
-              className={`w-full text-left px-2.5 py-1.5 rounded text-xs transition-colors flex items-center justify-between ${
+              onClick={() => historyManager.jumpToStep(0, onApplyToPage)}
+              className={`w-full text-left px-2.5 py-1.5 rounded text-xs transition-colors flex items-center justify-between border ${
                 undoCount === 0
-                  ? 'bg-neutral-800 text-neutral-100 font-medium'
-                  : 'text-neutral-500 hover:bg-neutral-900 hover:text-neutral-300'
+                  ? 'bg-indigo-50 border-indigo-200 text-indigo-950 font-medium'
+                  : 'border-transparent text-neutral-500 hover:bg-neutral-100 hover:text-neutral-800'
               }`}
             >
               <div className="flex items-center gap-2">
-                <RotateCcw className="w-3.5 h-3.5 text-neutral-500" />
-                <span>Blank Canvas</span>
+                <RotateCcw className="w-3.5 h-3.5 text-neutral-400" />
+                <span>Base Page State</span>
               </div>
-              {undoCount === 0 && <CheckCircle2 className="w-3.5 h-3.5 text-amber-400" />}
+              {undoCount === 0 && <CheckCircle2 className="w-3.5 h-3.5 text-indigo-600" />}
             </button>
 
             {timeline.map((entry, idx) => {
@@ -124,27 +141,30 @@ export const HistoryTimeline: React.FC<HistoryTimelineProps> = ({
               return (
                 <button
                   key={entry.id}
-                  onClick={() => historyManager.jumpToStep(stepIndex)}
-                  className={`w-full text-left px-2.5 py-1.5 rounded text-xs transition-colors flex items-start gap-2 ${
+                  onClick={() => historyManager.jumpToStep(stepIndex, onApplyToPage)}
+                  className={`w-full text-left px-2.5 py-1.5 rounded text-xs transition-colors flex items-start gap-2 border ${
                     isCurrentState
-                      ? 'bg-neutral-800 text-neutral-100 font-medium'
+                      ? 'bg-indigo-50 border-indigo-300 text-indigo-950 font-medium shadow-xs'
                       : isUndone
-                      ? 'text-neutral-600 hover:bg-neutral-900/60'
-                      : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'
+                      ? 'border-dashed border-neutral-200 text-neutral-400 hover:bg-neutral-50'
+                      : 'border-transparent text-neutral-700 hover:bg-neutral-100'
                   }`}
-                  title={`Step #${stepIndex}`}
+                  title={`Rewind / Fast-forward to step #${stepIndex}`}
                 >
-                  <div className="mt-0.5 shrink-0 opacity-70">
+                  <div className="mt-0.5 shrink-0 opacity-80">
                     {getCommandIcon(entry.type)}
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between gap-1">
                       <span className="truncate">{entry.description}</span>
-                      <span className="text-[10px] text-neutral-500 font-mono shrink-0">
+                      <span className="text-[10px] text-neutral-400 font-mono shrink-0">
                         {formatTimestamp(entry.timestamp)}
                       </span>
                     </div>
                   </div>
+                  {isCurrentState && (
+                    <div className="w-1.5 h-1.5 rounded-full bg-indigo-600 shrink-0 mt-1.5" />
+                  )}
                 </button>
               );
             })}
@@ -152,8 +172,8 @@ export const HistoryTimeline: React.FC<HistoryTimelineProps> = ({
         )}
       </div>
 
-      <div className="p-2.5 border-t border-neutral-800 text-[11px] text-neutral-500 font-mono text-center">
-        Click any action to rewind or fast-forward
+      <div className="p-2 border-t border-neutral-200 text-[10px] text-neutral-400 font-mono text-center bg-neutral-50">
+        Click any action to rewind or replay
       </div>
     </aside>
   );

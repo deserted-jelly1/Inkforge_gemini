@@ -10,6 +10,13 @@ export interface VectorPoint {
   timestamp: number;
 }
 
+export interface StrokeBounds {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
 export interface StrokeData {
   id: string;
   tool: ToolType;
@@ -18,12 +25,7 @@ export interface StrokeData {
   opacity: number;
   points: VectorPoint[];
   smoothedPoints?: VectorPoint[];
-  bounds: {
-    minX: number;
-    minY: number;
-    maxX: number;
-    maxY: number;
-  };
+  bounds: StrokeBounds;
 }
 
 export interface TextNoteContainer {
@@ -34,16 +36,22 @@ export interface TextNoteContainer {
   text: string;
 }
 
+export interface ViewportState {
+  zoom: number;
+  panX: number;
+  panY: number;
+}
+
 export interface PageData {
   id: string;
   title: string;
-  index?: number;
   createdAt: number;
   updatedAt: number;
   backgroundPattern: BackgroundPattern;
   gridSpacing: number;
+  viewport?: ViewportState;
   strokes: StrokeData[];
-  textNotes?: TextNoteContainer[];
+  textNotes: TextNoteContainer[];
 }
 
 export interface SectionData {
@@ -51,7 +59,6 @@ export interface SectionData {
   title: string;
   color: string;
   pages: PageData[];
-  activePageIndex: number;
 }
 
 export interface NotebookData {
@@ -61,10 +68,15 @@ export interface NotebookData {
   createdAt: number;
   updatedAt: number;
   sections: SectionData[];
-  activeSectionIndex: number;
-  // Backward compatibility convenience getters
-  pages: PageData[];
-  activePageIndex: number;
+  activeSectionId: string;
+  activePageId: string;
+}
+
+export interface BackupEnvelope {
+  schemaVersion: 2;
+  app: 'InkForge';
+  exportedAt: number;
+  notebook: NotebookData;
 }
 
 export interface TabletDiagnostics {

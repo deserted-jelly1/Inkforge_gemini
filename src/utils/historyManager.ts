@@ -1,134 +1,270 @@
-import { StrokeData } from '../types/inkforge';
+import { PageData, StrokeData, TextNoteContainer } from '../types/inkforge';
 
 export type CommandType =
   | 'add_stroke'
   | 'erase_stroke'
   | 'batch_erase'
-  | 'clear_canvas'
-  | 'macro';
+  | 'clear_ink'
+  | 'add_text'
+  | 'edit_text'
+  | 'move_text'
+  | 'resize_text'
+  | 'delete_text';
 
 export interface CommandLogEntry {
   id: string;
+  pageId: string;
   description: string;
   type: CommandType;
   timestamp: number;
-  strokeCountAffected: number;
   isUndone: boolean;
 }
 
-export interface ICanvasCommand {
+export interface IPageCommand {
   id: string;
+  pageId: string;
   description: string;
   type: CommandType;
   timestamp: number;
-  strokeCountAffected: number;
-  execute: () => void;
-  undo: () => void;
+  execute: (page: PageData) => PageData;
+  undo: (page: PageData) => PageData;
 }
 
-export class AddStrokeCommand implements ICanvasCommand {
+export class AddStrokeCommand implements IPageCommand {
   id: string;
   description: string;
   type: CommandType = 'add_stroke';
   timestamp: number;
-  strokeCountAffected = 1;
 
-  constructor(
-    private stroke: StrokeData,
-    private addFn: (stroke: StrokeData) => void,
-    private removeFn: (strokeId: string) => void
-  ) {
+  constructor(public pageId: string, public stroke: StrokeData) {
     this.id = `cmd_add_${stroke.id}`;
     const pts = stroke.points.length;
-    const toolName = stroke.tool === 'highlighter' ? 'Highlight' : 'Pen Stroke';
+    const toolName = stroke.tool === 'highlighter' ? 'Highlight' : 'Ink Stroke';
     this.description = `Add ${toolName} (${pts} pts)`;
     this.timestamp = Date.now();
   }
 
-  execute(): void {
-    this.addFn(this.stroke);
+  execute(page: PageData): PageData {
+    if (page.id !== this.pageId) return page;
+    if (page.strokes.some((s) => s.id === this.stroke.id)) return page;
+    return {
+      ...page,
+      strokes: [...page.strokes, this.stroke],
+      updatedAt: Date.now(),
+    };
   }
 
-  undo(): void {
-    this.removeFn(this.stroke.id);
+  undo(page: PageData): PageData {
+    if (page.id !== this.pageId) return page;
+    return {
+      ...page,
+      strokes: page.strokes.filter((s) => s.id !== this.stroke.id),
+      updatedAt: Date.now(),
+    };
   }
 }
 
-export class BatchEraseCommand implements ICanvasCommand {
+export class BatchEraseCommand implements IPageCommand {
   id: string;
   description: string;
   type: CommandType = 'batch_erase';
   timestamp: number;
-  strokeCountAffected: number;
 
   constructor(
-    private removedStrokes: StrokeData[],
-    private batchRemoveFn: (strokeIds: string[]) => void,
-    private batchRestoreFn: (strokes: StrokeData[]) => void
+    public pageId: string,
+    public removedStrokes: { stroke: StrokeData; index: number }[]
   ) {
     this.id = `cmd_erase_${Date.now()}`;
-    this.strokeCountAffected = removedStrokes.length;
-    this.description =
-      removedStrokes.length === 1
-        ? 'Erase Single Stroke'
-        : `Erase ${removedStrokes.length} Strokes`;
+    const count = removedStrokes.length;
+    this.description = count === 1 ? 'Erase Stroke' : `Erase ${count} Strokes`;
     this.timestamp = Date.now();
   }
 
-  execute(): void {
-    this.batchRemoveFn(this.removedStrokes.map((s) => s.id));
+  execute(page: PageData): PageData {
+    if (page.id !== this.pageId) return page;
+    const idsToRemove = new Set(this.removedStrokes.map((r) => r.stroke.id));
+    return {
+      ...page,
+      strokes: page.strokes.filter((s) => !idsToRemove.has(s.id)),
+      updatedAt: Date.now(),
+    };
   }
 
-  undo(): void {
-    this.batchRestoreFn(this.removedStrokes);
+  undo(page: PageData): PageData {
+    if (page.id !== this.pageId) return page;
+    // Restore strokes at their original positions if possible
+    const current = [...page.strokes];
+    // Sort by original index
+    const sorted = [...this.removedStrokes].sort((a, b) => a.index - b.index);
+    for (const item of sorted) {
+      if (!current.some((s) => s.id === item.stroke.id)) {
+        if (item.index >= 0 && item.index <= current.length) {
+          current.splice(item.index, 0, item.stroke);
+        } else {
+          current.push(item.stroke);
+        }
+      }
+    }
+    return {
+      ...page,
+      strokes: current,
+      updatedAt: Date.now(),
+    };
   }
 }
 
-export class ClearCanvasCommand implements ICanvasCommand {
+export class ClearInkCommand implements IPageCommand {
   id: string;
   description: string;
-  type: CommandType = 'clear_canvas';
+  type: CommandType = 'clear_ink';
   timestamp: number;
-  strokeCountAffected: number;
 
-  constructor(
-    private priorStrokes: StrokeData[],
-    private clearFn: () => void,
-    private restoreFn: (strokes: StrokeData[]) => void
-  ) {
+  constructor(public pageId: string, public priorStrokes: StrokeData[]) {
     this.id = `cmd_clear_${Date.now()}`;
-    this.strokeCountAffected = priorStrokes.length;
-    this.description = `Clear Canvas (${priorStrokes.length} strokes wiped)`;
+    this.description = `Clear Ink (${priorStrokes.length} strokes)`;
     this.timestamp = Date.now();
   }
 
-  execute(): void {
-    this.clearFn();
+  execute(page: PageData): PageData {
+    if (page.id !== this.pageId) return page;
+    return {
+      ...page,
+      strokes: [],
+      updatedAt: Date.now(),
+    };
   }
 
-  undo(): void {
-    this.restoreFn(this.priorStrokes);
+  undo(page: PageData): PageData {
+    if (page.id !== this.pageId) return page;
+    return {
+      ...page,
+      strokes: this.priorStrokes,
+      updatedAt: Date.now(),
+    };
+  }
+}
+
+export class AddTextNoteCommand implements IPageCommand {
+  id: string;
+  description = 'Add Text Box';
+  type: CommandType = 'add_text';
+  timestamp: number;
+
+  constructor(public pageId: string, public note: TextNoteContainer) {
+    this.id = `cmd_add_text_${note.id}`;
+    this.timestamp = Date.now();
+  }
+
+  execute(page: PageData): PageData {
+    if (page.id !== this.pageId) return page;
+    const existing = page.textNotes || [];
+    if (existing.some((n) => n.id === this.note.id)) return page;
+    return {
+      ...page,
+      textNotes: [...existing, this.note],
+      updatedAt: Date.now(),
+    };
+  }
+
+  undo(page: PageData): PageData {
+    if (page.id !== this.pageId) return page;
+    return {
+      ...page,
+      textNotes: (page.textNotes || []).filter((n) => n.id !== this.note.id),
+      updatedAt: Date.now(),
+    };
+  }
+}
+
+export class DeleteTextNoteCommand implements IPageCommand {
+  id: string;
+  description = 'Delete Text Box';
+  type: CommandType = 'delete_text';
+  timestamp: number;
+
+  constructor(public pageId: string, public note: TextNoteContainer) {
+    this.id = `cmd_del_text_${note.id}`;
+    this.timestamp = Date.now();
+  }
+
+  execute(page: PageData): PageData {
+    if (page.id !== this.pageId) return page;
+    return {
+      ...page,
+      textNotes: (page.textNotes || []).filter((n) => n.id !== this.note.id),
+      updatedAt: Date.now(),
+    };
+  }
+
+  undo(page: PageData): PageData {
+    if (page.id !== this.pageId) return page;
+    const existing = page.textNotes || [];
+    if (existing.some((n) => n.id === this.note.id)) return page;
+    return {
+      ...page,
+      textNotes: [...existing, this.note],
+      updatedAt: Date.now(),
+    };
+  }
+}
+
+export class UpdateTextNoteCommand implements IPageCommand {
+  id: string;
+  timestamp: number;
+
+  constructor(
+    public pageId: string,
+    public noteId: string,
+    public previousState: { x?: number; y?: number; width?: number; text?: string },
+    public newState: { x?: number; y?: number; width?: number; text?: string },
+    public type: CommandType,
+    public description: string
+  ) {
+    this.id = `cmd_upd_text_${Date.now()}`;
+    this.timestamp = Date.now();
+  }
+
+  execute(page: PageData): PageData {
+    if (page.id !== this.pageId) return page;
+    return {
+      ...page,
+      textNotes: (page.textNotes || []).map((n) =>
+        n.id === this.noteId ? { ...n, ...this.newState } : n
+      ),
+      updatedAt: Date.now(),
+    };
+  }
+
+  undo(page: PageData): PageData {
+    if (page.id !== this.pageId) return page;
+    return {
+      ...page,
+      textNotes: (page.textNotes || []).map((n) =>
+        n.id === this.noteId ? { ...n, ...this.previousState } : n
+      ),
+      updatedAt: Date.now(),
+    };
   }
 }
 
 /**
- * Command-pattern based History Manager.
- * Orchestrates undo/redo stacks, execution, and time-travel jumps.
+ * Page-scoped History Manager.
+ * Operates purely on explicit page ID and immutable state transformations.
  */
-export class HistoryManager {
-  private undoStack: ICanvasCommand[] = [];
-  private redoStack: ICanvasCommand[] = [];
+export class PageHistoryManager {
+  private undoStack: IPageCommand[] = [];
+  private redoStack: IPageCommand[] = [];
   private maxDepth: number;
   private onChangeCallbacks: Array<() => void> = [];
 
-  constructor(maxDepth = 100) {
+  constructor(public pageId: string, maxDepth = 100) {
     this.maxDepth = maxDepth;
   }
 
-  executeCommand(command: ICanvasCommand): void {
-    command.execute();
+  executeCommand(command: IPageCommand, applyToPage: (transform: (page: PageData) => PageData) => void): void {
+    applyToPage((page) => command.execute(page));
     this.undoStack.push(command);
-    this.redoStack = []; // Invalidate redo branch
+    this.redoStack = [];
 
     if (this.undoStack.length > this.maxDepth) {
       this.undoStack.shift();
@@ -136,35 +272,35 @@ export class HistoryManager {
     this.notify();
   }
 
-  undo(): boolean {
+  undo(applyToPage: (transform: (page: PageData) => PageData) => void): boolean {
     if (this.undoStack.length === 0) return false;
     const cmd = this.undoStack.pop()!;
-    cmd.undo();
+    applyToPage((page) => cmd.undo(page));
     this.redoStack.push(cmd);
     this.notify();
     return true;
   }
 
-  redo(): boolean {
+  redo(applyToPage: (transform: (page: PageData) => PageData) => void): boolean {
     if (this.redoStack.length === 0) return false;
     const cmd = this.redoStack.pop()!;
-    cmd.execute();
+    applyToPage((page) => cmd.execute(page));
     this.undoStack.push(cmd);
     this.notify();
     return true;
   }
 
-  jumpToStep(targetUndoCount: number): boolean {
+  jumpToStep(targetUndoCount: number, applyToPage: (transform: (page: PageData) => PageData) => void): boolean {
     if (targetUndoCount < 0 || targetUndoCount > this.undoStack.length + this.redoStack.length) {
       return false;
     }
 
     while (this.undoStack.length > targetUndoCount) {
-      if (!this.undo()) return false;
+      if (!this.undo(applyToPage)) return false;
     }
 
     while (this.undoStack.length < targetUndoCount) {
-      if (!this.redo()) return false;
+      if (!this.redo(applyToPage)) return false;
     }
 
     return true;
@@ -186,40 +322,30 @@ export class HistoryManager {
     return this.redoStack.length;
   }
 
-  clear(): void {
-    this.undoStack = [];
-    this.redoStack = [];
-    this.notify();
-  }
-
   getTimeline(): CommandLogEntry[] {
     const timeline: CommandLogEntry[] = [];
-
-    // Committed commands in undo stack (in chronological order)
     for (const cmd of this.undoStack) {
       timeline.push({
         id: cmd.id,
+        pageId: cmd.pageId,
         description: cmd.description,
         type: cmd.type,
         timestamp: cmd.timestamp,
-        strokeCountAffected: cmd.strokeCountAffected,
         isUndone: false,
       });
     }
 
-    // Commands currently in redo stack (undone, listed in future execution order)
     for (let i = this.redoStack.length - 1; i >= 0; i--) {
       const cmd = this.redoStack[i];
       timeline.push({
         id: cmd.id,
+        pageId: cmd.pageId,
         description: cmd.description,
         type: cmd.type,
         timestamp: cmd.timestamp,
-        strokeCountAffected: cmd.strokeCountAffected,
         isUndone: true,
       });
     }
-
     return timeline;
   }
 
@@ -234,5 +360,26 @@ export class HistoryManager {
     for (const cb of this.onChangeCallbacks) {
       cb();
     }
+  }
+}
+
+/**
+ * Registry maintaining page-scoped histories.
+ * Guarantees that Page B never touches Page A's history or content.
+ */
+export class PageHistoryRegistry {
+  private managers = new Map<string, PageHistoryManager>();
+
+  getHistoryManager(pageId: string): PageHistoryManager {
+    let mgr = this.managers.get(pageId);
+    if (!mgr) {
+      mgr = new PageHistoryManager(pageId);
+      this.managers.set(pageId, mgr);
+    }
+    return mgr;
+  }
+
+  removePage(pageId: string): void {
+    this.managers.delete(pageId);
   }
 }

@@ -3,12 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
-import { OneNoteRibbon } from './components/OneNoteRibbon';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { OneNoteRibbon, SaveStatus } from './components/OneNoteRibbon';
 import { OneNoteSidebar } from './components/OneNoteSidebar';
 import { OneNoteCanvas } from './components/OneNoteCanvas';
-import { ArchitectureViewer } from './components/ArchitectureViewer';
-import { CodeExplorer } from './components/CodeExplorer';
+import { DeveloperArea } from './components/DeveloperArea';
 import { HistoryTimeline } from './components/HistoryTimeline';
 import {
   NotebookData,
@@ -16,339 +15,493 @@ import {
   PageData,
   ToolType,
   BackgroundPattern,
-  StrokeData,
   TextNoteContainer,
 } from './types/inkforge';
-import { evaluateCentripetalCatmullRom } from './utils/spline';
-import { HistoryManager, ClearCanvasCommand } from './utils/historyManager';
+import {
+  PageHistoryRegistry,
+  ClearInkCommand,
+  AddTextNoteCommand,
+} from './utils/historyManager';
+import {
+  loadActiveNotebook,
+  saveActiveNotebook,
+  seedDefaultNotebook,
+  validateAndParseBackup,
+  createBackupEnvelope,
+} from './utils/storage';
+import { exportPageAsPNG, exportPageAsPDF } from './utils/exportPage';
+import { AlertCircle, X } from 'lucide-react';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'draw' | 'home' | 'view' | 'architecture' | 'code'>('draw');
+  const [activeTab, setActiveTab] = useState<'draw' | 'home' | 'view' | 'dev'>('draw');
 
-  // Drawing tools state
+  // Drawing tool states
   const [activeTool, setActiveTool] = useState<ToolType>('pen');
   const [activeColor, setActiveColor] = useState<string>('#0f172a');
   const [baseWidth, setBaseWidth] = useState<number>(2.2);
+  const [highlighterWidth, setHighlighterWidth] = useState<number>(16.0);
+  const [eraserRadius, setEraserRadius] = useState<number>(20);
   const [backgroundPattern, setBackgroundPattern] = useState<BackgroundPattern>('lined');
 
-  // Navigation sidebar collapse state
+  // Sidebar and History Drawer state
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(false);
   const [isHistoryOpen, setIsHistoryOpen] = useState<boolean>(false);
 
-  // Command History Manager
-  const [historyManager] = useState<HistoryManager>(() => new HistoryManager(120));
-  const [, setHistoryTick] = useState<number>(0);
+  // Persistence Save Status
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
+  const [importError, setImportError] = useState<string | null>(null);
+
+  // Page History Registry (maintains independent page-scoped undo/redo stacks)
+  const historyRegistryRef = useRef<PageHistoryRegistry>(new PageHistoryRegistry());
+  const [, setHistoryRenderTick] = useState<number>(0);
+
+  // Newly created note to focus
+  const [newNoteFocusId, setNewNoteFocusId] = useState<string | null>(null);
+
+  // Notebook state
+  const [notebook, setNotebook] = useState<NotebookData>(() => seedDefaultNotebook());
+  const [isLoaded, setIsLoaded] = useState<boolean>(false);
+
+  // Debounced Autosave Timer Ref
+  const autosaveTimeoutRef = useRef<any>(null);
+  const pendingNotebookRef = useRef<NotebookData>(notebook);
+
+  // 1. Initial Load: Restore from IndexedDB or seed on first use
+  useEffect(() => {
+    let isMounted = true;
+    loadActiveNotebook()
+      .then((savedNotebook) => {
+        if (!isMounted) return;
+        if (savedNotebook) {
+          setNotebook(savedNotebook);
+          pendingNotebookRef.current = savedNotebook;
+          // Set background pattern from active page
+          const activeSec =
+            savedNotebook.sections.find((s) => s.id === savedNotebook.activeSectionId) ||
+            savedNotebook.sections[0];
+          const activeP =
+            activeSec.pages.find((p) => p.id === savedNotebook.activePageId) || activeSec.pages[0];
+          if (activeP.backgroundPattern) {
+            setBackgroundPattern(activeP.backgroundPattern);
+          }
+        } else {
+          const seeded = seedDefaultNotebook();
+          setNotebook(seeded);
+          pendingNotebookRef.current = seeded;
+          saveActiveNotebook(seeded).catch(console.error);
+        }
+        setIsLoaded(true);
+      })
+      .catch((err) => {
+        console.error('Error loading notebook:', err);
+        setIsLoaded(true);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // 2. Debounced Autosave to IndexedDB
+  const triggerAutosave = useCallback((updatedNotebook: NotebookData) => {
+    pendingNotebookRef.current = updatedNotebook;
+    setSaveStatus('saving');
+
+    if (autosaveTimeoutRef.current) {
+      clearTimeout(autosaveTimeoutRef.current);
+    }
+
+    autosaveTimeoutRef.current = setTimeout(() => {
+      saveActiveNotebook(pendingNotebookRef.current)
+        .then(() => {
+          setSaveStatus('idle');
+        })
+        .catch((err) => {
+          console.error('Autosave failed:', err);
+          setSaveStatus('error');
+        });
+    }, 600);
+  }, []);
+
+  const handleRetrySave = () => {
+    setSaveStatus('saving');
+    saveActiveNotebook(pendingNotebookRef.current)
+      .then(() => setSaveStatus('idle'))
+      .catch(() => setSaveStatus('error'));
+  };
+
+  // Find active Section and Page by stable IDs
+  const activeSection =
+    notebook.sections.find((s) => s.id === notebook.activeSectionId) || notebook.sections[0];
+  const activePage =
+    activeSection.pages.find((p) => p.id === notebook.activePageId) || activeSection.pages[0];
+
+  // Subscribe to current page's history manager
+  const currentHistoryManager = historyRegistryRef.current.getHistoryManager(activePage.id);
 
   useEffect(() => {
-    return historyManager.subscribe(() => {
-      setHistoryTick((t) => t + 1);
+    return currentHistoryManager.subscribe(() => {
+      setHistoryRenderTick((t) => t + 1);
     });
-  }, [historyManager]);
+  }, [currentHistoryManager]);
 
-  // Initial OneNote Notebook hierarchy (Sections -> Pages)
-  const [notebook, setNotebook] = useState<NotebookData>(() => {
-    const stroke1Pts = [
-      { x: 120, y: 190, pressure: 0.45, tiltX: 0, tiltY: 0, timestamp: 1000 },
-      { x: 140, y: 195, pressure: 0.65, tiltX: 0, tiltY: 0, timestamp: 1010 },
-      { x: 165, y: 190, pressure: 0.75, tiltX: 0, tiltY: 0, timestamp: 1020 },
-      { x: 190, y: 185, pressure: 0.55, tiltX: 0, tiltY: 0, timestamp: 1030 },
-      { x: 220, y: 180, pressure: 0.40, tiltX: 0, tiltY: 0, timestamp: 1040 },
-    ];
+  // Update Page callback (page-scoped, purely transforms the active page)
+  const handleUpdateCurrentPage = useCallback(
+    (transform: (prevPage: PageData) => PageData) => {
+      setNotebook((prevNotebook) => {
+        const targetSectionId = prevNotebook.activeSectionId;
+        const targetPageId = prevNotebook.activePageId;
 
-    const stroke2Pts = [
-      { x: 170, y: 190, pressure: 0.50, tiltX: 0, tiltY: 0, timestamp: 1050 },
-      { x: 168, y: 220, pressure: 0.75, tiltX: 0, tiltY: 0, timestamp: 1060 },
-      { x: 165, y: 250, pressure: 0.85, tiltX: 0, tiltY: 0, timestamp: 1070 },
-      { x: 160, y: 275, pressure: 0.45, tiltX: 0, tiltY: 0, timestamp: 1080 },
-    ];
+        const updatedSections = prevNotebook.sections.map((sec) => {
+          if (sec.id !== targetSectionId) return sec;
+          const updatedPages = sec.pages.map((p) => {
+            if (p.id !== targetPageId) return p;
+            return transform(p);
+          });
+          return { ...sec, pages: updatedPages };
+        });
 
-    const s1: StrokeData = {
-      id: 'demo_stroke_1',
-      tool: 'pen',
-      color: '#1d4ed8',
-      baseWidth: 2.2,
-      opacity: 1.0,
-      points: stroke1Pts,
-      smoothedPoints: evaluateCentripetalCatmullRom(stroke1Pts, 8),
-      bounds: { minX: 120, minY: 180, maxX: 220, maxY: 195 },
-    };
-
-    const s2: StrokeData = {
-      id: 'demo_stroke_2',
-      tool: 'pen',
-      color: '#1d4ed8',
-      baseWidth: 2.2,
-      opacity: 1.0,
-      points: stroke2Pts,
-      smoothedPoints: evaluateCentripetalCatmullRom(stroke2Pts, 8),
-      bounds: { minX: 160, minY: 190, maxX: 170, maxY: 275 },
-    };
-
-    const sampleNote: TextNoteContainer = {
-      id: 'note_welcome',
-      x: 120,
-      y: 310,
-      width: 420,
-      text: '• Write notes naturally with your stylus or pen\n• Click anywhere on the paper to type\n• Seamlessly organize notes into Sections and Pages',
-    };
-
-    const initialPage1: PageData = {
-      id: 'p_surface_integrals',
-      title: "Calculus III — Surface Integrals & Stokes' Theorem",
-      createdAt: Date.now() - 7200000,
-      updatedAt: Date.now(),
-      backgroundPattern: 'lined',
-      gridSpacing: 28,
-      strokes: [s1, s2],
-      textNotes: [sampleNote],
-    };
-
-    const initialPage2: PageData = {
-      id: 'p_complex_analysis',
-      title: 'Residue Theorem & Contour Integration',
-      createdAt: Date.now() - 3600000,
-      updatedAt: Date.now(),
-      backgroundPattern: 'grid',
-      gridSpacing: 24,
-      strokes: [],
-      textNotes: [],
-    };
-
-    const mathSection: SectionData = {
-      id: 'sec_math',
-      title: 'Mathematics',
-      color: '#0284c7', // Sky Blue
-      pages: [initialPage1, initialPage2],
-      activePageIndex: 0,
-    };
-
-    const quickNotesSection: SectionData = {
-      id: 'sec_quick',
-      title: 'Quick Notes',
-      color: '#7e22ce', // OneNote Purple
-      pages: [
-        {
-          id: 'p_quick_1',
-          title: 'Project Ideas & Ink Engine Roadmap',
-          createdAt: Date.now() - 86400000,
+        const newNotebook: NotebookData = {
+          ...prevNotebook,
+          sections: updatedSections,
           updatedAt: Date.now(),
-          backgroundPattern: 'lined',
-          gridSpacing: 28,
-          strokes: [],
-          textNotes: [
-            {
-              id: 'note_q1',
-              x: 100,
-              y: 180,
-              width: 350,
-              text: 'Investigate One Euro filter coefficients for Wacom Intuos pen tablets.',
-            },
-          ],
-        },
-      ],
-      activePageIndex: 0,
-    };
+        };
 
-    const researchSection: SectionData = {
-      id: 'sec_research',
-      title: 'Research',
-      color: '#059669', // Emerald
-      pages: [
-        {
-          id: 'p_res_1',
-          title: 'Digital Ink Latency Benchmarks',
-          createdAt: Date.now() - 172800000,
-          updatedAt: Date.now(),
-          backgroundPattern: 'lined',
-          gridSpacing: 28,
-          strokes: [],
-          textNotes: [],
-        },
-      ],
-      activePageIndex: 0,
-    };
+        triggerAutosave(newNotebook);
+        return newNotebook;
+      });
+    },
+    [triggerAutosave]
+  );
 
-    return {
-      id: 'nb_onenote',
-      title: 'My Notebook',
-      color: '#7719aa',
-      createdAt: Date.now() - 604800000,
-      updatedAt: Date.now(),
-      sections: [mathSection, quickNotesSection, researchSection],
-      activeSectionIndex: 0,
-      pages: [initialPage1, initialPage2],
-      activePageIndex: 0,
-    };
-  });
+  // Section and Page Navigation
+  const handleSelectSection = (sectionId: string) => {
+    const sec = notebook.sections.find((s) => s.id === sectionId);
+    if (!sec) return;
+    const targetPageId = sec.pages[0]?.id || '';
 
-  const currentSection = notebook.sections[notebook.activeSectionIndex] || notebook.sections[0];
-  const currentPage = currentSection.pages[currentSection.activePageIndex] || currentSection.pages[0];
-
-  // Update Page callback
-  const handleUpdateCurrentPage = (updatedPage: PageData) => {
     setNotebook((prev) => {
-      const sections = [...prev.sections];
-      const sec = { ...sections[prev.activeSectionIndex] };
-      const pages = [...sec.pages];
-      pages[sec.activePageIndex] = updatedPage;
-      sec.pages = pages;
-      sections[prev.activeSectionIndex] = sec;
-      return {
+      const updated = {
         ...prev,
-        sections,
-        updatedAt: Date.now(),
+        activeSectionId: sectionId,
+        activePageId: targetPageId,
       };
+      triggerAutosave(updated);
+      return updated;
     });
+
+    // Sync background pattern of new page
+    if (sec.pages[0]?.backgroundPattern) {
+      setBackgroundPattern(sec.pages[0].backgroundPattern);
+    }
   };
 
-  // Section / Page Navigation
-  const handleSelectSection = (secIndex: number) => {
-    setNotebook((prev) => ({
-      ...prev,
-      activeSectionIndex: secIndex,
-    }));
-  };
-
-  const handleSelectPage = (pageIndex: number) => {
+  const handleSelectPage = (sectionId: string, pageId: string) => {
     setNotebook((prev) => {
-      const sections = [...prev.sections];
-      const sec = { ...sections[prev.activeSectionIndex] };
-      sec.activePageIndex = pageIndex;
-      sections[prev.activeSectionIndex] = sec;
-      return {
+      const updated = {
         ...prev,
-        sections,
+        activeSectionId: sectionId,
+        activePageId: pageId,
       };
+      triggerAutosave(updated);
+      return updated;
     });
+
+    const sec = notebook.sections.find((s) => s.id === sectionId);
+    const p = sec?.pages.find((page) => page.id === pageId);
+    if (p?.backgroundPattern) {
+      setBackgroundPattern(p.backgroundPattern);
+    }
   };
 
   const handleAddSection = () => {
-    const colors = ['#7e22ce', '#0284c7', '#059669', '#d97706', '#dc2626', '#4f46e5'];
+    const colors = ['#0284c7', '#7c3aed', '#059669', '#d97706', '#dc2626', '#4f46e5'];
     const newColor = colors[notebook.sections.length % colors.length];
+    const newSecId = `sec_${Date.now()}`;
+    const newPageId = `page_${Date.now()}`;
+
     const newSection: SectionData = {
-      id: `sec_${Date.now()}`,
+      id: newSecId,
       title: `Section ${notebook.sections.length + 1}`,
       color: newColor,
       pages: [
         {
-          id: `p_${Date.now()}`,
+          id: newPageId,
           title: 'Untitled page',
           createdAt: Date.now(),
           updatedAt: Date.now(),
           backgroundPattern: 'lined',
           gridSpacing: 28,
+          viewport: { zoom: 1.0, panX: 0, panY: 0 },
           strokes: [],
           textNotes: [],
         },
       ],
-      activePageIndex: 0,
     };
 
-    setNotebook((prev) => ({
-      ...prev,
-      sections: [...prev.sections, newSection],
-      activeSectionIndex: prev.sections.length,
-      updatedAt: Date.now(),
-    }));
+    setNotebook((prev) => {
+      const updated = {
+        ...prev,
+        sections: [...prev.sections, newSection],
+        activeSectionId: newSecId,
+        activePageId: newPageId,
+        updatedAt: Date.now(),
+      };
+      triggerAutosave(updated);
+      return updated;
+    });
   };
 
-  const handleAddPage = () => {
+  const handleRenameSection = (sectionId: string, newTitle: string) => {
+    setNotebook((prev) => {
+      const updatedSections = prev.sections.map((s) =>
+        s.id === sectionId ? { ...s, title: newTitle } : s
+      );
+      const updated = { ...prev, sections: updatedSections, updatedAt: Date.now() };
+      triggerAutosave(updated);
+      return updated;
+    });
+  };
+
+  const handleChangeSectionColor = (sectionId: string, color: string) => {
+    setNotebook((prev) => {
+      const updatedSections = prev.sections.map((s) =>
+        s.id === sectionId ? { ...s, color } : s
+      );
+      const updated = { ...prev, sections: updatedSections, updatedAt: Date.now() };
+      triggerAutosave(updated);
+      return updated;
+    });
+  };
+
+  const handleDeleteSection = (sectionId: string) => {
+    if (notebook.sections.length <= 1) return;
+    setNotebook((prev) => {
+      const remainingSections = prev.sections.filter((s) => s.id !== sectionId);
+      let newActiveSectionId = prev.activeSectionId;
+      let newActivePageId = prev.activePageId;
+
+      if (sectionId === prev.activeSectionId) {
+        newActiveSectionId = remainingSections[0].id;
+        newActivePageId = remainingSections[0].pages[0]?.id || '';
+      }
+
+      const updated = {
+        ...prev,
+        sections: remainingSections,
+        activeSectionId: newActiveSectionId,
+        activePageId: newActivePageId,
+        updatedAt: Date.now(),
+      };
+      triggerAutosave(updated);
+      return updated;
+    });
+  };
+
+  const handleAddPage = (sectionId: string) => {
+    const newPageId = `page_${Date.now()}`;
     const newPage: PageData = {
-      id: `p_${Date.now()}`,
+      id: newPageId,
       title: 'Untitled page',
       createdAt: Date.now(),
       updatedAt: Date.now(),
       backgroundPattern,
       gridSpacing: 28,
+      viewport: { zoom: 1.0, panX: 0, panY: 0 },
       strokes: [],
       textNotes: [],
     };
 
     setNotebook((prev) => {
-      const sections = [...prev.sections];
-      const sec = { ...sections[prev.activeSectionIndex] };
-      sec.pages = [...sec.pages, newPage];
-      sec.activePageIndex = sec.pages.length - 1;
-      sections[prev.activeSectionIndex] = sec;
-      return {
+      const updatedSections = prev.sections.map((s) =>
+        s.id === sectionId ? { ...s, pages: [...s.pages, newPage] } : s
+      );
+      const updated = {
         ...prev,
-        sections,
+        sections: updatedSections,
+        activeSectionId: sectionId,
+        activePageId: newPageId,
         updatedAt: Date.now(),
       };
+      triggerAutosave(updated);
+      return updated;
     });
   };
 
-  const handleDeletePage = (pageIndex: number) => {
-    if (currentSection.pages.length <= 1) return;
+  const handleDuplicatePage = (sectionId: string, pageId: string) => {
+    const sec = notebook.sections.find((s) => s.id === sectionId);
+    const sourcePage = sec?.pages.find((p) => p.id === pageId);
+    if (!sourcePage) return;
+
+    const newPageId = `page_${Date.now()}`;
+    const duplicatedPage: PageData = {
+      ...sourcePage,
+      id: newPageId,
+      title: `${sourcePage.title} (Copy)`,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      strokes: sourcePage.strokes.map((s) => ({ ...s, id: `stroke_${Date.now()}_${Math.random()}` })),
+      textNotes: sourcePage.textNotes?.map((n) => ({ ...n, id: `note_${Date.now()}_${Math.random()}` })),
+    };
+
     setNotebook((prev) => {
-      const sections = [...prev.sections];
-      const sec = { ...sections[prev.activeSectionIndex] };
-      sec.pages = sec.pages.filter((_, idx) => idx !== pageIndex);
-      if (sec.activePageIndex >= sec.pages.length) {
-        sec.activePageIndex = sec.pages.length - 1;
-      }
-      sections[prev.activeSectionIndex] = sec;
-      return {
+      const updatedSections = prev.sections.map((s) =>
+        s.id === sectionId ? { ...s, pages: [...s.pages, duplicatedPage] } : s
+      );
+      const updated = {
         ...prev,
-        sections,
+        sections: updatedSections,
+        activeSectionId: sectionId,
+        activePageId: newPageId,
         updatedAt: Date.now(),
       };
+      triggerAutosave(updated);
+      return updated;
     });
   };
 
-  const handleClearPage = () => {
-    if (currentPage.strokes.length === 0) return;
-    const priorStrokes = [...currentPage.strokes];
+  const handleDeletePage = (sectionId: string, pageId: string) => {
+    const sec = notebook.sections.find((s) => s.id === sectionId);
+    if (!sec || sec.pages.length <= 1) return;
 
-    const clearCmd = new ClearCanvasCommand(
-      priorStrokes,
-      () => {
-        handleUpdateCurrentPage({
-          ...currentPage,
-          strokes: [],
-        });
-      },
-      (restoredStrokes) => {
-        handleUpdateCurrentPage({
-          ...currentPage,
-          strokes: restoredStrokes,
-        });
+    setNotebook((prev) => {
+      const updatedSections = prev.sections.map((s) => {
+        if (s.id !== sectionId) return s;
+        return { ...s, pages: s.pages.filter((p) => p.id !== pageId) };
+      });
+
+      let newActivePageId = prev.activePageId;
+      if (prev.activePageId === pageId) {
+        const remainingPages = updatedSections.find((s) => s.id === sectionId)!.pages;
+        newActivePageId = remainingPages[0].id;
       }
-    );
 
-    historyManager.executeCommand(clearCmd);
+      const updated = {
+        ...prev,
+        sections: updatedSections,
+        activePageId: newActivePageId,
+        updatedAt: Date.now(),
+      };
+      triggerAutosave(updated);
+      return updated;
+    });
+
+    historyRegistryRef.current.removePage(pageId);
   };
 
+  const handleRenameNotebook = (newTitle: string) => {
+    setNotebook((prev) => {
+      const updated = { ...prev, title: newTitle, updatedAt: Date.now() };
+      triggerAutosave(updated);
+      return updated;
+    });
+  };
+
+  // Clear Ink (preserving text and recoverable via undo)
+  const handleClearInk = () => {
+    if (activePage.strokes.length === 0) return;
+    const prior = [...activePage.strokes];
+    const cmd = new ClearInkCommand(activePage.id, prior);
+    currentHistoryManager.executeCommand(cmd, handleUpdateCurrentPage);
+  };
+
+  // Insert Text Box Action
   const handleInsertTextBox = () => {
+    const noteId = `note_${Date.now()}`;
     const newNote: TextNoteContainer = {
-      id: `note_${Date.now()}`,
-      x: 120,
+      id: noteId,
+      x: 130,
       y: 220,
       width: 320,
       text: '',
     };
-    handleUpdateCurrentPage({
-      ...currentPage,
-      textNotes: [...(currentPage.textNotes || []), newNote],
-    });
+    const cmd = new AddTextNoteCommand(activePage.id, newNote);
+    currentHistoryManager.executeCommand(cmd, handleUpdateCurrentPage);
+    setNewNoteFocusId(noteId);
     setActiveTool('text');
   };
 
-  const handleExport = () => {
-    const jsonBlob = new Blob([JSON.stringify(notebook, null, 2)], {
+  // Export JSON Backup
+  const handleExportJSON = () => {
+    const envelope = createBackupEnvelope(notebook);
+    const jsonBlob = new Blob([JSON.stringify(envelope, null, 2)], {
       type: 'application/json',
     });
     const url = URL.createObjectURL(jsonBlob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `OneNote_${notebook.title.replace(/\s+/g, '_')}_${Date.now()}.json`;
+    a.download = `InkForge_Backup_${notebook.title.replace(/\s+/g, '_')}_${Date.now()}.json`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
+  // Restore JSON Backup
+  const handleImportJSON = (file: File) => {
+    setImportError(null);
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target?.result as string;
+      const { notebook: validated, error } = validateAndParseBackup(text);
+      if (error || !validated) {
+        setImportError(error || 'Failed to parse backup.');
+        return;
+      }
+
+      setNotebook(validated);
+      pendingNotebookRef.current = validated;
+      saveActiveNotebook(validated)
+        .then(() => setSaveStatus('idle'))
+        .catch(() => setSaveStatus('error'));
+
+      const sec =
+        validated.sections.find((s) => s.id === validated.activeSectionId) || validated.sections[0];
+      const p = sec.pages.find((page) => page.id === validated.activePageId) || sec.pages[0];
+      if (p.backgroundPattern) {
+        setBackgroundPattern(p.backgroundPattern);
+      }
+    };
+    reader.onerror = () => setImportError('Failed to read file.');
+    reader.readAsText(file);
+  };
+
+  // Paper background change
+  const handleChangePattern = (p: BackgroundPattern) => {
+    setBackgroundPattern(p);
+    handleUpdateCurrentPage((prev) => ({
+      ...prev,
+      backgroundPattern: p,
+      updatedAt: Date.now(),
+    }));
+  };
+
+  if (!isLoaded) {
+    return (
+      <div className="w-screen h-screen flex items-center justify-center bg-neutral-50 text-neutral-600 font-sans text-xs">
+        Loading InkForge Notebook...
+      </div>
+    );
+  }
+
   return (
-    <div className="w-screen h-screen flex flex-col bg-[#f0f2f5] text-neutral-900 overflow-hidden font-sans antialiased">
-      {/* 1. OneNote Ribbon Toolbar */}
+    <div className="w-screen h-screen flex flex-col bg-[#f8fafc] text-neutral-900 overflow-hidden font-sans antialiased">
+      {/* Import Error Banner */}
+      {importError && (
+        <div className="bg-rose-50 border-b border-rose-200 px-4 py-2 flex items-center justify-between text-xs text-rose-800 z-50">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+            <span>{importError}</span>
+          </div>
+          <button
+            onClick={() => setImportError(null)}
+            className="p-1 hover:bg-rose-100 rounded text-rose-600"
+            aria-label="Dismiss error"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      {/* 1. Ribbon Bar */}
       <OneNoteRibbon
         activeTool={activeTool}
         setActiveTool={setActiveTool}
@@ -356,59 +509,76 @@ export default function App() {
         setActiveColor={setActiveColor}
         baseWidth={baseWidth}
         setBaseWidth={setBaseWidth}
+        highlighterWidth={highlighterWidth}
+        setHighlighterWidth={setHighlighterWidth}
+        eraserRadius={eraserRadius}
+        setEraserRadius={setEraserRadius}
         backgroundPattern={backgroundPattern}
-        setBackgroundPattern={setBackgroundPattern}
-        historyManager={historyManager}
-        onClearPage={handleClearPage}
+        setBackgroundPattern={handleChangePattern}
+        historyManager={currentHistoryManager}
+        onUndo={() => currentHistoryManager.undo(handleUpdateCurrentPage)}
+        onRedo={() => currentHistoryManager.redo(handleUpdateCurrentPage)}
+        onClearInk={handleClearInk}
         onToggleHistory={() => setIsHistoryOpen(!isHistoryOpen)}
         isHistoryOpen={isHistoryOpen}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
-        onExport={handleExport}
         onInsertTextBox={handleInsertTextBox}
+        onExportPNG={() => exportPageAsPNG(activePage, notebook.title)}
+        onExportPDF={() => exportPageAsPDF(activePage, notebook.title)}
+        onExportJSON={handleExportJSON}
+        onImportJSON={handleImportJSON}
+        saveStatus={saveStatus}
+        onRetrySave={handleRetrySave}
       />
 
-      {/* 2. Workspace Layout */}
+      {/* 2. Workspace Body */}
       <div className="flex-1 flex overflow-hidden">
-        {/* OneNote Navigation Sidebar */}
+        {/* Navigation Sidebar */}
         <OneNoteSidebar
-          notebookTitle={notebook.title}
-          sections={notebook.sections}
-          activeSectionIndex={notebook.activeSectionIndex}
-          activePageIndex={currentSection.activePageIndex}
-          isCollapsed={isSidebarCollapsed}
-          onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+          notebook={notebook}
           onSelectSection={handleSelectSection}
           onSelectPage={handleSelectPage}
           onAddSection={handleAddSection}
+          onRenameSection={handleRenameSection}
+          onChangeSectionColor={handleChangeSectionColor}
+          onDeleteSection={handleDeleteSection}
           onAddPage={handleAddPage}
+          onDuplicatePage={handleDuplicatePage}
           onDeletePage={handleDeletePage}
+          onRenameNotebook={handleRenameNotebook}
+          isCollapsed={isSidebarCollapsed}
+          onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
         />
 
-        {/* Primary View Switcher based on Ribbon Tab */}
+        {/* Canvas Surface or Developer Area */}
         <div className="flex-1 flex overflow-hidden relative">
           {(activeTab === 'draw' || activeTab === 'home' || activeTab === 'view') && (
             <OneNoteCanvas
-              page={currentPage}
+              key={activePage.id}
+              page={activePage}
               onUpdatePage={handleUpdateCurrentPage}
               activeTool={activeTool}
               activeColor={activeColor}
               baseWidth={baseWidth}
+              highlighterWidth={highlighterWidth}
+              eraserRadius={eraserRadius}
               backgroundPattern={backgroundPattern}
-              historyManager={historyManager}
+              historyManager={currentHistoryManager}
+              newNoteFocusId={newNoteFocusId}
+              onClearNewNoteFocus={() => setNewNoteFocusId(null)}
             />
           )}
 
-          {activeTab === 'architecture' && <ArchitectureViewer />}
-
-          {activeTab === 'code' && <CodeExplorer />}
+          {activeTab === 'dev' && <DeveloperArea />}
         </div>
 
-        {/* History Timeline Drawer */}
+        {/* Page-Scoped History Timeline Drawer */}
         <HistoryTimeline
-          historyManager={historyManager}
+          historyManager={currentHistoryManager}
           isOpen={isHistoryOpen}
           onClose={() => setIsHistoryOpen(false)}
+          onApplyToPage={handleUpdateCurrentPage}
         />
       </div>
     </div>

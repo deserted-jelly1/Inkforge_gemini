@@ -9,48 +9,120 @@ import {
 } from '../types/inkforge';
 import { evaluateCentripetalCatmullRom, computeDynamicWidth } from '../utils/spline';
 import {
-  HistoryManager,
+  PageHistoryManager,
   AddStrokeCommand,
   BatchEraseCommand,
+  AddTextNoteCommand,
+  DeleteTextNoteCommand,
+  UpdateTextNoteCommand,
 } from '../utils/historyManager';
-import { X, Move, Plus, ZoomIn, ZoomOut } from 'lucide-react';
+import { strokeIntersectsEraser, isStrokeInViewport } from '../utils/geometry';
+import { X, Move, GripVertical, ZoomIn, ZoomOut, RotateCcw } from 'lucide-react';
 
-interface OneNoteCanvasProps {
+interface CanvasProps {
   page: PageData;
-  onUpdatePage: (updatedPage: PageData) => void;
+  onUpdatePage: (transform: (prevPage: PageData) => PageData) => void;
   activeTool: ToolType;
   activeColor: string;
   baseWidth: number;
+  highlighterWidth: number;
+  eraserRadius: number;
   backgroundPattern: BackgroundPattern;
-  historyManager: HistoryManager;
+  historyManager: PageHistoryManager;
+  newNoteFocusId: string | null;
+  onClearNewNoteFocus: () => void;
 }
 
-export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
+export const OneNoteCanvas: React.FC<CanvasProps> = ({
   page,
   onUpdatePage,
   activeTool,
   activeColor,
   baseWidth,
+  highlighterWidth,
+  eraserRadius,
   backgroundPattern,
   historyManager,
+  newNoteFocusId,
+  onClearNewNoteFocus,
 }) => {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const baseCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const activeCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Zoom & Pan state
-  const [zoom, setZoom] = useState<number>(1.0);
-  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  // Viewport state: initialize from page.viewport if available
+  const [zoom, setZoom] = useState<number>(() => page.viewport?.zoom || 1.0);
+  const [pan, setPan] = useState<{ x: number; y: number }>(() => ({
+    x: page.viewport?.panX || 0,
+    y: page.viewport?.panY || 0,
+  }));
 
-  // In-flight drawing points
+  // Track page ID to reset viewport when page changes
+  const lastPageIdRef = useRef<string>(page.id);
+  useEffect(() => {
+    if (page.id !== lastPageIdRef.current) {
+      lastPageIdRef.current = page.id;
+      if (page.viewport) {
+        setZoom(page.viewport.zoom);
+        setPan({ x: page.viewport.panX, y: page.viewport.panY });
+      } else {
+        setZoom(1.0);
+        setPan({ x: 0, y: 0 });
+      }
+    }
+  }, [page.id, page.viewport]);
+
+  // Persist viewport to page data (debounced)
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      onUpdatePage((prev) => {
+        if (
+          prev.viewport &&
+          prev.viewport.zoom === zoom &&
+          prev.viewport.panX === pan.x &&
+          prev.viewport.panY === pan.y
+        ) {
+          return prev;
+        }
+        return {
+          ...prev,
+          viewport: { zoom, panX: pan.x, panY: pan.y },
+        };
+      });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [zoom, pan, onUpdatePage]);
+
+  // Active in-flight stroke points & gesture state
+  const activePointerIdRef = useRef<number | null>(null);
+  const activeGestureToolRef = useRef<ToolType>('pen');
   const activePointsRef = useRef<VectorPoint[]>([]);
   const isPointerDownRef = useRef<boolean>(false);
   const isPanningRef = useRef<boolean>(false);
   const lastPanPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
-  const erasedStrokesThisGestureRef = useRef<StrokeData[]>([]);
+  const erasedStrokesThisGestureRef = useRef<{ stroke: StrokeData; index: number }[]>([]);
 
-  // Text Containers
-  const textNotes = page.textNotes || [];
+  // Text note drag / resize state
+  const [draggingNoteId, setDraggingNoteId] = useState<string | null>(null);
+  const dragStartPosRef = useRef<{ clientX: number; clientY: number; noteX: number; noteY: number }>({
+    clientX: 0,
+    clientY: 0,
+    noteX: 0,
+    noteY: 0,
+  });
 
+  const [resizingNoteId, setResizingNoteId] = useState<string | null>(null);
+  const resizeStartPosRef = useRef<{ clientX: number; noteWidth: number }>({
+    clientX: 0,
+    noteWidth: 320,
+  });
+
+  const textBeforeEditRef = useRef<Map<string, string>>(new Map());
+
+  // Animation frame request ID for active stroke rendering
+  const rAFRef = useRef<number | null>(null);
+
+  // Coordinate transformations
   const screenToWorld = useCallback(
     (screenX: number, screenY: number) => {
       return {
@@ -71,21 +143,47 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
     [pan, zoom]
   );
 
-  // Format date header like OneNote: "Wednesday, September 30, 2026  4:48 AM"
-  const formattedDate = new Date(page.createdAt).toLocaleDateString(undefined, {
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-  });
-  const formattedTime = new Date(page.createdAt).toLocaleTimeString(undefined, {
-    hour: 'numeric',
-    minute: '2-digit',
-  });
+  // Focus newly created note
+  useEffect(() => {
+    if (newNoteFocusId) {
+      const textarea = document.getElementById(`textarea_${newNoteFocusId}`) as HTMLTextAreaElement | null;
+      if (textarea) {
+        textarea.focus();
+        onClearNewNoteFocus();
+      }
+    }
+  }, [newNoteFocusId, onClearNewNoteFocus]);
 
-  // Render Canvas
-  const redraw = useCallback(() => {
-    const canvas = canvasRef.current;
+  // Global Keyboard shortcuts for Undo/Redo (without hijacking native text editing)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+        return; // Allow native undo/redo inside text fields
+      }
+
+      const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+      const isUndo = (isMac ? e.metaKey : e.ctrlKey) && e.key.toLowerCase() === 'z' && !e.shiftKey;
+      const isRedo =
+        ((isMac ? e.metaKey : e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'z') ||
+        ((isMac ? e.metaKey : e.ctrlKey) && e.key.toLowerCase() === 'y');
+
+      if (isUndo) {
+        e.preventDefault();
+        historyManager.undo(onUpdatePage);
+      } else if (isRedo) {
+        e.preventDefault();
+        historyManager.redo(onUpdatePage);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [historyManager, onUpdatePage]);
+
+  // 1. Redraw Base Canvas (Paper background, rules, and committed strokes with culling)
+  const redrawBase = useCallback(() => {
+    const canvas = baseCanvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
@@ -97,30 +195,27 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
     ctx.save();
     ctx.scale(dpr, dpr);
 
-    // 1. Pristine OneNote White Paper
+    // Pristine paper background
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, width, height);
 
-    // 2. Ruled Lines or Grid Pattern
-    const spacing = 28.0 * zoom;
+    // Ruled lines / Grid based on world coordinates
+    const spacing = (page.gridSpacing || 28) * zoom;
+    const headerWorldY = 120;
+    const headerScreenY = worldToScreen(0, headerWorldY).y;
     const offsetY = pan.y % spacing;
 
     if (backgroundPattern === 'lined') {
-      // Horizontal blue ruled notebook lines
-      ctx.strokeStyle = '#e0e7ff';
+      ctx.strokeStyle = '#e2e8f0';
       ctx.lineWidth = 1.0;
       ctx.beginPath();
-      // Start lines below the header area
-      const headerWorldY = 120;
-      const headerScreenY = worldToScreen(0, headerWorldY).y;
-
       for (let y = Math.max(headerScreenY, offsetY); y < height; y += spacing) {
         ctx.moveTo(0, y);
         ctx.lineTo(width, y);
       }
       ctx.stroke();
 
-      // OneNote vertical pink margin guide
+      // Vertical pink margin guide line
       const marginWorldX = 72;
       const marginScreenX = worldToScreen(marginWorldX, 0).x;
       if (marginScreenX >= 0 && marginScreenX <= width) {
@@ -158,17 +253,39 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
       }
     }
 
-    // 3. Render Strokes
+    // Viewport bounds in world space for stroke culling
+    const viewportMinWorld = screenToWorld(0, 0);
+    const viewportMaxWorld = screenToWorld(width, height);
+    const minWX = Math.min(viewportMinWorld.x, viewportMaxWorld.x);
+    const minWY = Math.min(viewportMinWorld.y, viewportMaxWorld.y);
+    const maxWX = Math.max(viewportMinWorld.x, viewportMaxWorld.x);
+    const maxWY = Math.max(viewportMinWorld.y, viewportMaxWorld.y);
+
+    // Render committed strokes
     for (const stroke of page.strokes) {
+      if (stroke.bounds && !isStrokeInViewport(stroke.bounds, minWX, minWY, maxWX, maxWY)) {
+        continue; // Culled!
+      }
+
       const pts = stroke.smoothedPoints || stroke.points;
-      if (pts.length < 2) continue;
+      if (pts.length < 2) {
+        if (pts.length === 1) {
+          // Pen tap dot
+          const p = worldToScreen(pts[0].x, pts[0].y);
+          ctx.fillStyle = stroke.color;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, (stroke.baseWidth * zoom) * 0.75, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        continue;
+      }
 
       if (stroke.tool === 'highlighter') {
         ctx.save();
         ctx.globalCompositeOperation = 'multiply';
         ctx.strokeStyle = stroke.color;
         ctx.globalAlpha = 0.35;
-        ctx.lineWidth = stroke.baseWidth * 3.5 * zoom;
+        ctx.lineWidth = stroke.baseWidth * zoom;
         ctx.lineCap = 'butt';
         ctx.lineJoin = 'round';
 
@@ -201,37 +318,66 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
       }
     }
 
-    // 4. Render Active In-Flight Stroke
-    const activePts = activePointsRef.current;
-    if (activePts.length >= 2) {
-      if (activeTool === 'highlighter') {
+    ctx.restore();
+  }, [page.strokes, page.gridSpacing, backgroundPattern, zoom, pan, screenToWorld, worldToScreen]);
+
+  // 2. Redraw Active Canvas (Only in-flight stroke, ultra fast)
+  const redrawActive = useCallback(() => {
+    const canvas = activeCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const width = canvas.width / dpr;
+    const height = canvas.height / dpr;
+
+    ctx.clearRect(0, 0, width, height);
+
+    const activePoints = activePointsRef.current;
+    if (activePoints.length === 0) return;
+
+    ctx.save();
+    ctx.scale(dpr, dpr);
+
+    const tool = activeGestureToolRef.current;
+    const strokeWidth = tool === 'highlighter' ? highlighterWidth : baseWidth;
+
+    if (activePoints.length === 1) {
+      const p = worldToScreen(activePoints[0].x, activePoints[0].y);
+      ctx.fillStyle = activeColor;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, (strokeWidth * zoom) * 0.75, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      if (tool === 'highlighter') {
         ctx.save();
         ctx.globalCompositeOperation = 'multiply';
         ctx.strokeStyle = activeColor;
         ctx.globalAlpha = 0.35;
-        ctx.lineWidth = baseWidth * 3.5 * zoom;
+        ctx.lineWidth = strokeWidth * zoom;
         ctx.lineCap = 'butt';
         ctx.lineJoin = 'round';
 
         ctx.beginPath();
-        const p0 = worldToScreen(activePts[0].x, activePts[0].y);
+        const p0 = worldToScreen(activePoints[0].x, activePoints[0].y);
         ctx.moveTo(p0.x, p0.y);
-        for (let i = 1; i < activePts.length; ++i) {
-          const pi = worldToScreen(activePts[i].x, activePts[i].y);
+        for (let i = 1; i < activePoints.length; ++i) {
+          const pi = worldToScreen(activePoints[i].x, activePoints[i].y);
           ctx.lineTo(pi.x, pi.y);
         }
         ctx.stroke();
         ctx.restore();
-      } else if (activeTool === 'pen') {
+      } else if (tool === 'pen') {
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
         ctx.strokeStyle = activeColor;
 
-        for (let i = 0; i < activePts.length - 1; ++i) {
-          const p1 = worldToScreen(activePts[i].x, activePts[i].y);
-          const p2 = worldToScreen(activePts[i + 1].x, activePts[i + 1].y);
-          const avgPressure = (activePts[i].pressure + activePts[i + 1].pressure) * 0.5;
-          const dynWidth = computeDynamicWidth(baseWidth * zoom, avgPressure, 'pen');
+        for (let i = 0; i < activePoints.length - 1; ++i) {
+          const p1 = worldToScreen(activePoints[i].x, activePoints[i].y);
+          const p2 = worldToScreen(activePoints[i + 1].x, activePoints[i + 1].y);
+          const avgPressure = (activePoints[i].pressure + activePoints[i + 1].pressure) * 0.5;
+          const dynWidth = computeDynamicWidth(strokeWidth * zoom, avgPressure, 'pen');
 
           ctx.lineWidth = dynWidth;
           ctx.beginPath();
@@ -243,39 +389,98 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
     }
 
     ctx.restore();
-  }, [page.strokes, activeTool, activeColor, baseWidth, backgroundPattern, zoom, pan, worldToScreen]);
+  }, [activeColor, baseWidth, highlighterWidth, zoom, worldToScreen]);
 
-  // Window Resize
+  // Setup ResizeObserver for container size
   useEffect(() => {
-    const handleResize = () => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const rect = canvas.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = rect.width * dpr;
-      canvas.height = rect.height * dpr;
-      redraw();
-    };
-    handleResize();
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, [redraw]);
+    const container = containerRef.current;
+    if (!container) return;
 
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        const dpr = window.devicePixelRatio || 1;
+
+        if (baseCanvasRef.current) {
+          baseCanvasRef.current.width = width * dpr;
+          baseCanvasRef.current.height = height * dpr;
+        }
+        if (activeCanvasRef.current) {
+          activeCanvasRef.current.width = width * dpr;
+          activeCanvasRef.current.height = height * dpr;
+        }
+        redrawBase();
+      }
+    });
+
+    resizeObserver.observe(container);
+    return () => resizeObserver.disconnect();
+  }, [redrawBase]);
+
+  // Trigger base redraw when strokes or viewport change
   useEffect(() => {
-    redraw();
-  }, [redraw]);
+    redrawBase();
+  }, [redrawBase]);
 
-  // Handle pointer down
+  // Segment Eraser execution
+  const executeEraserAt = (worldX: number, worldY: number) => {
+    const strokes = page.strokes;
+    const hitItems: { stroke: StrokeData; index: number }[] = [];
+
+    for (let i = 0; i < strokes.length; i++) {
+      const s = strokes[i];
+      if (erasedStrokesThisGestureRef.current.some((already) => already.stroke.id === s.id)) {
+        continue;
+      }
+      if (strokeIntersectsEraser(s, worldX, worldY, eraserRadius / zoom)) {
+        hitItems.push({ stroke: s, index: i });
+      }
+    }
+
+    if (hitItems.length > 0) {
+      erasedStrokesThisGestureRef.current.push(...hitItems);
+      const hitIds = new Set(hitItems.map((h) => h.stroke.id));
+      onUpdatePage((prev) => ({
+        ...prev,
+        strokes: prev.strokes.filter((s) => !hitIds.has(s.id)),
+      }));
+    }
+  };
+
+  // Pointer event handlers
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    canvas.setPointerCapture(e.pointerId);
+    // Only capture single primary pointer for drawing
+    if (activePointerIdRef.current !== null) return;
+    activePointerIdRef.current = e.pointerId;
 
-    const rect = canvas.getBoundingClientRect();
+    const canvas = activeCanvasRef.current;
+    if (canvas) {
+      try {
+        canvas.setPointerCapture(e.pointerId);
+      } catch {
+        // ignore capture errors
+      }
+    }
+
+    const rect = canvas?.getBoundingClientRect() || { left: 0, top: 0 };
     const screenX = e.clientX - rect.left;
     const screenY = e.clientY - rect.top;
 
-    if (activeTool === 'pan' || e.button === 1 || e.buttons === 4) {
+    // Detect gesture tool at start of gesture
+    let currentTool = activeTool;
+    const isHardwareEraser =
+      e.buttons === 32 ||
+      e.button === 5 ||
+      e.button === 2 ||
+      (e.pointerType === 'pen' && (e.buttons & 32) === 32);
+
+    if (isHardwareEraser) {
+      currentTool = 'eraser';
+    }
+    activeGestureToolRef.current = currentTool;
+
+    // Pan mode or middle mouse click
+    if (currentTool === 'pan' || e.button === 1 || e.buttons === 4) {
       isPanningRef.current = true;
       lastPanPosRef.current = { x: screenX, y: screenY };
       return;
@@ -284,8 +489,8 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
     const world = screenToWorld(screenX, screenY);
     const pressure = e.pressure > 0 ? e.pressure : 0.5;
 
-    // Click to add text container in Type mode
-    if (activeTool === 'text') {
+    // Type mode: click to place a text box
+    if (currentTool === 'text') {
       const newNote: TextNoteContainer = {
         id: `note_${Date.now()}`,
         x: Math.round(world.x),
@@ -293,38 +498,21 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
         width: 320,
         text: '',
       };
-      onUpdatePage({
-        ...page,
-        textNotes: [...textNotes, newNote],
-        updatedAt: Date.now(),
-      });
+      const cmd = new AddTextNoteCommand(page.id, newNote);
+      historyManager.executeCommand(cmd, onUpdatePage);
+      activePointerIdRef.current = null;
       return;
     }
 
     // Eraser mode
-    if (activeTool === 'eraser' || (e.pointerType === 'pen' && e.buttons === 32)) {
+    if (currentTool === 'eraser') {
       isPointerDownRef.current = true;
       erasedStrokesThisGestureRef.current = [];
-      const tolerance = 14.0 / zoom;
-      const hit = page.strokes.filter((s) =>
-        s.points.some((p) => {
-          const dx = p.x - world.x;
-          const dy = p.y - world.y;
-          return dx * dx + dy * dy <= tolerance * tolerance;
-        })
-      );
-      if (hit.length > 0) {
-        erasedStrokesThisGestureRef.current.push(...hit);
-        const hitIds = new Set(hit.map((s) => s.id));
-        onUpdatePage({
-          ...page,
-          strokes: page.strokes.filter((s) => !hitIds.has(s.id)),
-        });
-      }
+      executeEraserAt(world.x, world.y);
       return;
     }
 
-    // Drawing with Pen or Highlighter
+    // Drawing (Pen or Highlighter)
     isPointerDownRef.current = true;
     activePointsRef.current = [
       {
@@ -336,13 +524,15 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
         timestamp: Date.now(),
       },
     ];
-    redraw();
+
+    redrawActive();
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
+    if (activePointerIdRef.current !== e.pointerId) return;
+
+    const canvas = activeCanvasRef.current;
+    const rect = canvas?.getBoundingClientRect() || { left: 0, top: 0 };
     const screenX = e.clientX - rect.left;
     const screenY = e.clientY - rect.top;
 
@@ -355,137 +545,176 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
     }
 
     if (!isPointerDownRef.current) return;
-    const world = screenToWorld(screenX, screenY);
-    const pressure = e.pressure > 0 ? e.pressure : 0.5;
 
-    if (activeTool === 'eraser' || (e.pointerType === 'pen' && e.buttons === 32)) {
-      const tolerance = 14.0 / zoom;
-      const hit = page.strokes.filter((s) => {
-        if (erasedStrokesThisGestureRef.current.some((already) => already.id === s.id)) return false;
-        return s.points.some((p) => {
-          const dx = p.x - world.x;
-          const dy = p.y - world.y;
-          return dx * dx + dy * dy <= tolerance * tolerance;
-        });
-      });
-      if (hit.length > 0) {
-        erasedStrokesThisGestureRef.current.push(...hit);
-        const hitIds = new Set(hit.map((s) => s.id));
-        onUpdatePage({
-          ...page,
-          strokes: page.strokes.filter((s) => !hitIds.has(s.id)),
-        });
+    // Collect coalesced points if digitizer supports high frequency
+    const nativeEvent = e.nativeEvent as PointerEvent;
+    const coalescedEvents =
+      typeof nativeEvent?.getCoalescedEvents === 'function'
+        ? nativeEvent.getCoalescedEvents()
+        : [e];
+
+    const currentTool = activeGestureToolRef.current;
+    if (currentTool === 'eraser') {
+      for (const cev of coalescedEvents) {
+        const cx = cev.clientX - rect.left;
+        const cy = cev.clientY - rect.top;
+        const cw = screenToWorld(cx, cy);
+        executeEraserAt(cw.x, cw.y);
       }
       return;
     }
 
-    activePointsRef.current.push({
-      x: world.x,
-      y: world.y,
-      pressure,
-      tiltX: e.tiltX || 0,
-      tiltY: e.tiltY || 0,
-      timestamp: Date.now(),
-    });
-    redraw();
+    // Add sampled points
+    for (const cev of coalescedEvents) {
+      const cx = cev.clientX - rect.left;
+      const cy = cev.clientY - rect.top;
+      const cw = screenToWorld(cx, cy);
+      const cp = cev.pressure > 0 ? cev.pressure : 0.5;
+
+      activePointsRef.current.push({
+        x: cw.x,
+        y: cw.y,
+        pressure: cp,
+        tiltX: cev.tiltX || 0,
+        tiltY: cev.tiltY || 0,
+        timestamp: Date.now(),
+      });
+    }
+
+    // Request active canvas redraw in rAF
+    if (rAFRef.current === null) {
+      rAFRef.current = requestAnimationFrame(() => {
+        redrawActive();
+        rAFRef.current = null;
+      });
+    }
+  };
+
+  const finalizeStrokeOrEraser = () => {
+    if (rAFRef.current !== null) {
+      cancelAnimationFrame(rAFRef.current);
+      rAFRef.current = null;
+    }
+
+    const currentTool = activeGestureToolRef.current;
+
+    // Finalize Eraser gesture
+    if (currentTool === 'eraser') {
+      if (erasedStrokesThisGestureRef.current.length > 0) {
+        const removed = [...erasedStrokesThisGestureRef.current];
+        erasedStrokesThisGestureRef.current = [];
+        const cmd = new BatchEraseCommand(page.id, removed);
+        historyManager.executeCommand(cmd, onUpdatePage);
+      }
+      isPointerDownRef.current = false;
+      activePointerIdRef.current = null;
+      return;
+    }
+
+    // Finalize Pen or Highlighter
+    const points = activePointsRef.current;
+    if (points.length > 0) {
+      const toolWidth = currentTool === 'highlighter' ? highlighterWidth : baseWidth;
+
+      // Handle pen tap dot
+      if (points.length === 1) {
+        const pt = points[0];
+        const r = toolWidth * 0.75;
+        const dotStroke: StrokeData = {
+          id: `stroke_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          tool: currentTool,
+          color: activeColor,
+          baseWidth: toolWidth,
+          opacity: currentTool === 'highlighter' ? 0.35 : 1.0,
+          points: [pt],
+          smoothedPoints: [pt],
+          bounds: { minX: pt.x - r, minY: pt.y - r, maxX: pt.x + r, maxY: pt.y + r },
+        };
+        const cmd = new AddStrokeCommand(page.id, dotStroke);
+        historyManager.executeCommand(cmd, onUpdatePage);
+      } else {
+        const smoothed = evaluateCentripetalCatmullRom(points, 8);
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+
+        for (const pt of points) {
+          if (pt.x < minX) minX = pt.x;
+          if (pt.y < minY) minY = pt.y;
+          if (pt.x > maxX) maxX = pt.x;
+          if (pt.y > maxY) maxY = pt.y;
+        }
+
+        const margin = toolWidth * 1.5;
+        const newStroke: StrokeData = {
+          id: `stroke_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          tool: currentTool,
+          color: activeColor,
+          baseWidth: toolWidth,
+          opacity: currentTool === 'highlighter' ? 0.35 : 1.0,
+          points: [...points],
+          smoothedPoints: smoothed,
+          bounds: { minX: minX - margin, minY: minY - margin, maxX: maxX + margin, maxY: maxY + margin },
+        };
+        const cmd = new AddStrokeCommand(page.id, newStroke);
+        historyManager.executeCommand(cmd, onUpdatePage);
+      }
+    }
+
+    activePointsRef.current = [];
+    isPointerDownRef.current = false;
+    activePointerIdRef.current = null;
+
+    // Clear active canvas and let base canvas render the newly committed stroke
+    const canvas = activeCanvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
+    }
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
+    if (activePointerIdRef.current !== e.pointerId) return;
+
+    const canvas = activeCanvasRef.current;
     if (canvas && canvas.hasPointerCapture(e.pointerId)) {
-      canvas.releasePointerCapture(e.pointerId);
+      try {
+        canvas.releasePointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
     }
 
     if (isPanningRef.current) {
       isPanningRef.current = false;
+      activePointerIdRef.current = null;
       return;
     }
 
-    if (!isPointerDownRef.current) return;
-    isPointerDownRef.current = false;
-
-    if (activeTool === 'eraser' || (e.pointerType === 'pen' && e.buttons === 32)) {
-      if (erasedStrokesThisGestureRef.current.length > 0) {
-        const removed = [...erasedStrokesThisGestureRef.current];
-        erasedStrokesThisGestureRef.current = [];
-        const cmd = new BatchEraseCommand(
-          removed,
-          (ids) => {
-            const idSet = new Set(ids);
-            onUpdatePage({
-              ...page,
-              strokes: page.strokes.filter((s) => !idSet.has(s.id)),
-            });
-          },
-          (restored) => {
-            onUpdatePage({
-              ...page,
-              strokes: [...page.strokes, ...restored],
-            });
-          }
-        );
-        historyManager.executeCommand(cmd);
-      }
-      return;
+    if (isPointerDownRef.current) {
+      finalizeStrokeOrEraser();
     }
+  };
 
-    const points = activePointsRef.current;
-    if (points.length >= 2) {
-      const smoothed = evaluateCentripetalCatmullRom(points, 8);
-
-      let minX = Infinity;
-      let minY = Infinity;
-      let maxX = -Infinity;
-      let maxY = -Infinity;
-      for (const pt of points) {
-        if (pt.x < minX) minX = pt.x;
-        if (pt.y < minY) minY = pt.y;
-        if (pt.x > maxX) maxX = pt.x;
-        if (pt.y > maxY) maxY = pt.y;
-      }
-
-      const newStroke: StrokeData = {
-        id: `stroke_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-        tool: activeTool,
-        color: activeColor,
-        baseWidth,
-        opacity: activeTool === 'highlighter' ? 0.35 : 1.0,
-        points: [...points],
-        smoothedPoints: smoothed,
-        bounds: { minX, minY, maxX, maxY },
-      };
-
-      const addCmd = new AddStrokeCommand(
-        newStroke,
-        (s) => {
-          onUpdatePage({
-            ...page,
-            strokes: [...page.strokes, s],
-            updatedAt: Date.now(),
-          });
-        },
-        (id) => {
-          onUpdatePage({
-            ...page,
-            strokes: page.strokes.filter((s) => s.id !== id),
-            updatedAt: Date.now(),
-          });
-        }
-      );
-
-      historyManager.executeCommand(addCmd);
+  const handlePointerCancel = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (activePointerIdRef.current !== e.pointerId) return;
+    if (isPointerDownRef.current) {
+      finalizeStrokeOrEraser();
     }
-
-    activePointsRef.current = [];
-    redraw();
+    isPanningRef.current = false;
+    activePointerIdRef.current = null;
   };
 
   // Wheel zoom
-  const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
+  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
     e.preventDefault();
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
+    const container = containerRef.current;
+    if (!container) return;
+
+    const rect = container.getBoundingClientRect();
     const mouseX = e.clientX - rect.left;
     const mouseY = e.clientY - rect.top;
 
@@ -500,42 +729,174 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
     }));
   };
 
-  // Update text container text
-  const handleUpdateTextNote = (id: string, text: string) => {
-    onUpdatePage({
-      ...page,
-      textNotes: textNotes.map((n) => (n.id === id ? { ...n, text } : n)),
-    });
+  // Text Note Dragging
+  const startNoteDrag = (noteId: string, e: React.PointerEvent) => {
+    e.stopPropagation();
+    const note = page.textNotes?.find((n) => n.id === noteId);
+    if (!note) return;
+
+    setDraggingNoteId(noteId);
+    dragStartPosRef.current = {
+      clientX: e.clientX,
+      clientY: e.clientY,
+      noteX: note.x,
+      noteY: note.y,
+    };
   };
 
-  // Delete text container
-  const handleDeleteTextNote = (id: string) => {
-    onUpdatePage({
-      ...page,
-      textNotes: textNotes.filter((n) => n.id !== id),
-    });
+  // Text Note Resizing
+  const startNoteResize = (noteId: string, e: React.PointerEvent) => {
+    e.stopPropagation();
+    const note = page.textNotes?.find((n) => n.id === noteId);
+    if (!note) return;
+
+    setResizingNoteId(noteId);
+    resizeStartPosRef.current = {
+      clientX: e.clientX,
+      noteWidth: note.width,
+    };
   };
 
-  // Header position calculation relative to viewport pan/zoom
+  // Global window listeners for drag & resize
+  useEffect(() => {
+    if (!draggingNoteId && !resizingNoteId) return;
+
+    const handlePointerMove = (e: PointerEvent) => {
+      if (draggingNoteId) {
+        const dx = (e.clientX - dragStartPosRef.current.clientX) / zoom;
+        const dy = (e.clientY - dragStartPosRef.current.clientY) / zoom;
+        const targetX = Math.round(dragStartPosRef.current.noteX + dx);
+        const targetY = Math.round(dragStartPosRef.current.noteY + dy);
+
+        onUpdatePage((prev) => ({
+          ...prev,
+          textNotes: (prev.textNotes || []).map((n) =>
+            n.id === draggingNoteId ? { ...n, x: targetX, y: targetY } : n
+          ),
+        }));
+      } else if (resizingNoteId) {
+        const dx = (e.clientX - resizeStartPosRef.current.clientX) / zoom;
+        const newWidth = Math.max(160, Math.round(resizeStartPosRef.current.noteWidth + dx));
+
+        onUpdatePage((prev) => ({
+          ...prev,
+          textNotes: (prev.textNotes || []).map((n) =>
+            n.id === resizingNoteId ? { ...n, width: newWidth } : n
+          ),
+        }));
+      }
+    };
+
+    const handlePointerUp = () => {
+      if (draggingNoteId) {
+        const note = page.textNotes?.find((n) => n.id === draggingNoteId);
+        if (note && (note.x !== dragStartPosRef.current.noteX || note.y !== dragStartPosRef.current.noteY)) {
+          const cmd = new UpdateTextNoteCommand(
+            page.id,
+            draggingNoteId,
+            { x: dragStartPosRef.current.noteX, y: dragStartPosRef.current.noteY },
+            { x: note.x, y: note.y },
+            'move_text',
+            'Move Text Box'
+          );
+          historyManager.executeCommand(cmd, () => {});
+        }
+        setDraggingNoteId(null);
+      }
+
+      if (resizingNoteId) {
+        const note = page.textNotes?.find((n) => n.id === resizingNoteId);
+        if (note && note.width !== resizeStartPosRef.current.noteWidth) {
+          const cmd = new UpdateTextNoteCommand(
+            page.id,
+            resizingNoteId,
+            { width: resizeStartPosRef.current.noteWidth },
+            { width: note.width },
+            'resize_text',
+            'Resize Text Box'
+          );
+          historyManager.executeCommand(cmd, () => {});
+        }
+        setResizingNoteId(null);
+      }
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+  }, [draggingNoteId, resizingNoteId, zoom, page.textNotes, page.id, historyManager, onUpdatePage]);
+
+  // Record text change history on blur
+  const handleNoteFocus = (noteId: string, currentText: string) => {
+    if (!textBeforeEditRef.current.has(noteId)) {
+      textBeforeEditRef.current.set(noteId, currentText);
+    }
+  };
+
+  const handleNoteBlur = (noteId: string, newText: string) => {
+    const priorText = textBeforeEditRef.current.get(noteId);
+    textBeforeEditRef.current.delete(noteId);
+
+    if (priorText !== undefined && priorText !== newText) {
+      const cmd = new UpdateTextNoteCommand(
+        page.id,
+        noteId,
+        { text: priorText },
+        { text: newText },
+        'edit_text',
+        'Edit Text'
+      );
+      historyManager.executeCommand(cmd, () => {});
+    }
+  };
+
+  const handleDeleteNote = (noteId: string) => {
+    const note = page.textNotes?.find((n) => n.id === noteId);
+    if (!note) return;
+    const cmd = new DeleteTextNoteCommand(page.id, note);
+    historyManager.executeCommand(cmd, onUpdatePage);
+  };
+
+  // Synchronized header position
   const headerScreenPos = worldToScreen(72, 32);
+
+  const formattedDate = new Date(page.createdAt).toLocaleDateString(undefined, {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  });
+  const formattedTime = new Date(page.createdAt).toLocaleTimeString(undefined, {
+    hour: 'numeric',
+    minute: '2-digit',
+  });
 
   return (
     <div
       ref={containerRef}
-      className="flex-1 relative overflow-hidden bg-white select-none cursor-crosshair"
+      onWheel={handleWheel}
+      className="flex-1 relative overflow-hidden bg-white select-none touch-none cursor-crosshair"
     >
-      {/* HTML Drawing Canvas */}
+      {/* Layer 1: Base Canvas (Paper background, rules, committed strokes) */}
       <canvas
-        ref={canvasRef}
+        ref={baseCanvasRef}
+        className="absolute inset-0 w-full h-full block pointer-events-none"
+      />
+
+      {/* Layer 2: Active Canvas (Pointer capture & active gesture stroke) */}
+      <canvas
+        ref={activeCanvasRef}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerUp}
-        onWheel={handleWheel}
-        className="w-full h-full block"
+        onPointerCancel={handlePointerCancel}
+        className="absolute inset-0 w-full h-full block touch-none z-10"
       />
 
-      {/* OneNote Signature Editable Page Title & Date Header */}
+      {/* Synchronized Editable Page Title & Date Header */}
       <div
         style={{
           position: 'absolute',
@@ -544,14 +905,18 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
           transform: `scale(${zoom})`,
           transformOrigin: 'top left',
         }}
-        className="pointer-events-auto w-[650px] space-y-1 z-10"
+        className="pointer-events-auto w-[680px] space-y-1 z-20"
       >
         <input
           type="text"
           value={page.title}
-          placeholder="Page Title"
-          onChange={(e) => onUpdatePage({ ...page, title: e.target.value })}
-          className="w-full text-2xl font-semibold text-neutral-900 bg-transparent border-b border-transparent hover:border-neutral-300 focus:border-purple-600 focus:outline-none transition-colors px-1 py-0.5"
+          placeholder="Untitled page"
+          onChange={(e) => {
+            const newTitle = e.target.value;
+            onUpdatePage((prev) => ({ ...prev, title: newTitle, updatedAt: Date.now() }));
+          }}
+          className="w-full text-2xl font-semibold text-neutral-900 bg-transparent border-b border-transparent hover:border-neutral-300 focus:border-indigo-600 focus:outline-none transition-colors px-1 py-0.5"
+          aria-label="Page Title"
         />
 
         <div className="flex items-center gap-2 text-[11px] font-sans text-neutral-500 px-1">
@@ -560,12 +925,12 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
           <span>{formattedTime}</span>
         </div>
 
-        {/* Traditional separator line beneath title header */}
-        <div className="w-full h-px bg-neutral-300 dark:bg-neutral-700 mt-2" />
+        {/* Separator rule beneath header */}
+        <div className="w-full h-px bg-neutral-300 mt-2" />
       </div>
 
-      {/* OneNote Draggable Text Containers */}
-      {textNotes.map((note) => {
+      {/* Text Containers (Fixed double-scaling, fully draggable & resizable) */}
+      {(page.textNotes || []).map((note) => {
         const screenPos = worldToScreen(note.x, note.y);
         return (
           <div
@@ -574,39 +939,72 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
               position: 'absolute',
               left: `${screenPos.x}px`,
               top: `${screenPos.y}px`,
-              width: `${note.width * zoom}px`,
+              width: `${note.width}px`, // Fixed double-scaling bug: width is in world units, transformed by zoom
               transform: `scale(${zoom})`,
               transformOrigin: 'top left',
             }}
-            className="group pointer-events-auto bg-white/90 backdrop-blur-xs border border-transparent hover:border-purple-300 focus-within:border-purple-500 rounded p-1 shadow-xs hover:shadow-sm transition-all z-10"
+            className="group pointer-events-auto bg-white/95 backdrop-blur-xs border border-neutral-300 hover:border-indigo-400 focus-within:border-indigo-600 rounded shadow-xs hover:shadow-md transition-shadow z-20"
           >
-            {/* Draggable Note Container Header Handle */}
-            <div className="h-4 bg-neutral-100 group-hover:bg-purple-100/70 rounded-t flex items-center justify-between px-1 cursor-move select-none text-neutral-500">
-              <Move className="w-2.5 h-2.5" />
+            {/* Draggable Header Handle */}
+            <div
+              onPointerDown={(e) => startNoteDrag(note.id, e)}
+              className="h-5 bg-neutral-100 group-hover:bg-indigo-50/80 rounded-t flex items-center justify-between px-1.5 cursor-move select-none text-neutral-500"
+            >
+              <div className="flex items-center gap-1">
+                <Move className="w-3 h-3 text-neutral-400" />
+                <span className="text-[10px] font-sans font-medium text-neutral-400">Note</span>
+              </div>
               <button
-                onClick={() => handleDeleteTextNote(note.id)}
-                className="hover:text-rose-500 p-0.5 rounded"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleDeleteNote(note.id);
+                }}
+                className="hover:text-rose-600 p-0.5 rounded transition-colors"
+                title="Delete note box"
+                aria-label="Delete note box"
               >
-                <X className="w-2.5 h-2.5" />
+                <X className="w-3 h-3" />
               </button>
             </div>
 
+            {/* Note Text Field */}
             <textarea
+              id={`textarea_${note.id}`}
               value={note.text}
-              placeholder="Type notes here..."
-              onChange={(e) => handleUpdateTextNote(note.id, e.target.value)}
-              className="w-full bg-transparent text-xs text-neutral-800 focus:outline-none resize-none p-1.5 min-h-[60px]"
+              placeholder="Type your notes here..."
+              onFocus={() => handleNoteFocus(note.id, note.text)}
+              onBlur={(e) => handleNoteBlur(note.id, e.target.value)}
+              onChange={(e) => {
+                const val = e.target.value;
+                onUpdatePage((prev) => ({
+                  ...prev,
+                  textNotes: (prev.textNotes || []).map((n) =>
+                    n.id === note.id ? { ...n, text: val } : n
+                  ),
+                }));
+              }}
+              className="w-full bg-transparent text-xs text-neutral-900 focus:outline-none resize-none p-2 min-h-[70px] font-sans leading-relaxed"
             />
+
+            {/* Right Resize Handle */}
+            <div
+              onPointerDown={(e) => startNoteResize(note.id, e)}
+              className="absolute right-0 top-5 bottom-0 w-2.5 cursor-ew-resize flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+              title="Drag to resize note width"
+            >
+              <GripVertical className="w-2.5 h-2.5 text-neutral-400" />
+            </div>
           </div>
         );
       })}
 
-      {/* OneNote Discreet Zoom Slider & Page Reset (Bottom Right) */}
-      <div className="absolute bottom-3 right-4 z-20 flex items-center gap-1.5 bg-white/90 backdrop-blur-md px-2.5 py-1 rounded-md border border-neutral-200 shadow-xs text-xs font-mono text-neutral-600">
+      {/* Discreet Bottom-Right Zoom Bar */}
+      <div className="absolute bottom-3 right-4 z-30 flex items-center gap-1.5 bg-white/90 backdrop-blur-md px-2.5 py-1 rounded-md border border-neutral-200 shadow-xs text-xs font-mono text-neutral-600">
         <button
           onClick={() => setZoom((z) => Math.max(0.3, z * 0.9))}
-          className="p-1 hover:text-neutral-900 rounded"
+          className="p-1 hover:text-neutral-900 rounded transition-colors"
           title="Zoom Out"
+          aria-label="Zoom Out"
         >
           <ZoomOut className="w-3.5 h-3.5" />
         </button>
@@ -615,15 +1013,17 @@ export const OneNoteCanvas: React.FC<OneNoteCanvasProps> = ({
             setZoom(1.0);
             setPan({ x: 0, y: 0 });
           }}
-          className="hover:text-purple-700 transition-colors tabular-nums font-medium"
+          className="hover:text-indigo-600 transition-colors tabular-nums font-medium px-1"
           title="Reset Zoom to 100%"
+          aria-label="Reset Zoom"
         >
           {Math.round(zoom * 100)}%
         </button>
         <button
           onClick={() => setZoom((z) => Math.min(3.5, z * 1.1))}
-          className="p-1 hover:text-neutral-900 rounded"
+          className="p-1 hover:text-neutral-900 rounded transition-colors"
           title="Zoom In"
+          aria-label="Zoom In"
         >
           <ZoomIn className="w-3.5 h-3.5" />
         </button>
