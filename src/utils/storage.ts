@@ -474,6 +474,30 @@ export function validateAndParseBackup(jsonString: string): { notebook?: Noteboo
             return { error: `Stroke "${str.id}" point #${ptIdx} has non-finite coordinates or out-of-range pressure.` };
           }
         }
+
+        // Rigorously validate smoothedPoints if present
+        if ('smoothedPoints' in str && str.smoothedPoints !== undefined && str.smoothedPoints !== null) {
+          if (!Array.isArray(str.smoothedPoints)) {
+            return { error: `Stroke "${str.id}" smoothedPoints must be an array or omitted.` };
+          }
+          for (let smIdx = 0; smIdx < str.smoothedPoints.length; smIdx++) {
+            const smPt = str.smoothedPoints[smIdx];
+            if (
+              !smPt ||
+              typeof smPt !== 'object' ||
+              !Number.isFinite(smPt.x) ||
+              !Number.isFinite(smPt.y) ||
+              !Number.isFinite(smPt.pressure) ||
+              smPt.pressure < 0 ||
+              smPt.pressure > 1
+            ) {
+              return { error: `Stroke "${str.id}" has invalid or malformed smoothedPoints (contained null or invalid point at index ${smIdx}).` };
+            }
+          }
+        }
+
+        // Safely recompute clean Catmull-Rom derived spline points
+        str.smoothedPoints = evaluateCentripetalCatmullRom(str.points, 8);
       }
 
       // Validate Text Notes

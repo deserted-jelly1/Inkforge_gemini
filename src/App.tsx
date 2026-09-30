@@ -8,6 +8,7 @@ import { OneNoteRibbon, SaveStatus } from './components/OneNoteRibbon';
 import { OneNoteSidebar } from './components/OneNoteSidebar';
 import { OneNoteCanvas } from './components/OneNoteCanvas';
 import { DeveloperArea } from './components/DeveloperArea';
+import { HandwritingLab } from './components/HandwritingLab/HandwritingLab';
 import { HistoryTimeline } from './components/HistoryTimeline';
 import {
   NotebookData,
@@ -33,7 +34,7 @@ import { exportPageAsPNG, exportPageAsPDF } from './utils/exportPage';
 import { AlertCircle, X, RefreshCw } from 'lucide-react';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'draw' | 'home' | 'view' | 'dev'>('draw');
+  const [activeTab, setActiveTab] = useState<'draw' | 'home' | 'view' | 'lab' | 'dev'>('draw');
 
   // Drawing tool states
   const [activeTool, setActiveTool] = useState<ToolType>('pen');
@@ -648,6 +649,8 @@ export default function App() {
               onClearNewNoteFocus={() => setNewNoteFocusId(null)}
             />
           )}
+
+          {activeTab === 'lab' && <HandwritingLab />}
 
           {activeTab === 'dev' && <DeveloperArea />}
         </div>

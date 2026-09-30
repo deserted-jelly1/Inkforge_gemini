@@ -21,6 +21,7 @@ import {
   CheckCircle2,
   AlertTriangle,
   Code2,
+  Sparkles,
 } from 'lucide-react';
 
 export type SaveStatus = 'idle' | 'saving' | 'error';
@@ -44,8 +45,8 @@ interface RibbonProps {
   onClearInk: () => void;
   onToggleHistory: () => void;
   isHistoryOpen: boolean;
-  activeTab: 'draw' | 'home' | 'view' | 'dev';
-  setActiveTab: (tab: 'draw' | 'home' | 'view' | 'dev') => void;
+  activeTab: 'draw' | 'home' | 'view' | 'lab' | 'dev';
+  setActiveTab: (tab: 'draw' | 'home' | 'view' | 'lab' | 'dev') => void;
   onInsertTextBox: () => void;
   onExportPNG: () => void;
   onExportPDF: () => void;
@@ -207,6 +208,18 @@ export const OneNoteRibbon: React.FC<RibbonProps> = ({
             }`}
           >
             Paper View
+          </button>
+
+          <button
+            onClick={() => setActiveTab('lab')}
+            className={`px-3 py-1.5 rounded-t-sm transition-colors border-b-2 flex items-center gap-1.5 ${
+              activeTab === 'lab'
+                ? 'border-indigo-600 text-indigo-700 font-semibold'
+                : 'border-transparent text-indigo-600 hover:text-indigo-800'
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            <span>Handwriting Lab</span>
           </button>
 
           <button

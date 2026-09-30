@@ -311,3 +311,224 @@ test('11. Paper Pattern: Derived per page and preserved across navigation', () =
   const currentP = activeSec.pages.find((p) => p.id === nb.activePageId)!;
   assert.equal(currentP.backgroundPattern, 'lined');
 });
+
+// -------------------------------------------------------------
+// 7. Rigorous smoothedPoints Import Validation
+// -------------------------------------------------------------
+test('12. Backup Validation: Rejects malformed smoothedPoints: [null] without modifying state', () => {
+  const nb = seedDefaultNotebook();
+  const corruptNb = JSON.parse(JSON.stringify(nb));
+  // Inject [null] as smoothedPoints in the first stroke
+  corruptNb.sections[0].pages[0].strokes[0].smoothedPoints = [null];
+
+  const res = validateAndParseBackup(JSON.stringify(corruptNb));
+  assert.equal(res.notebook, undefined, 'Malformed smoothedPoints must reject notebook import');
+  assert.ok(
+    res.error?.includes('invalid or malformed smoothedPoints'),
+    `Expected smoothedPoints error message, got: ${res.error}`
+  );
+});
+
+// -------------------------------------------------------------
+// 8. Handwriting Profile Storage & Validation
+// -------------------------------------------------------------
+test('13. Profile Round-trip: Serializing, exporting, and parsing preserves sample geometry', async () => {
+  const { createNewProfile, validateAndParseProfile } = await import('../handwriting/profileStorage.ts');
+  const { createStarterSample } = await import('../handwriting/defaultGlyphs.ts');
+
+  const profile = createNewProfile('Alice Script');
+  profile.glyphs['a'] = [createStarterSample('a')];
+  profile.glyphs['b'] = [createStarterSample('b')];
+
+  const json = JSON.stringify(profile);
+  const { profile: parsed, error } = validateAndParseProfile(json);
+
+  assert.equal(error, undefined, 'Valid profile must parse without error');
+  assert.ok(parsed, 'Parsed profile should exist');
+  assert.equal(parsed.name, 'Alice Script');
+  assert.equal(parsed.schemaVersion, 1);
+  assert.equal(parsed.app, 'InkForge-HandwritingProfile');
+  assert.equal(parsed.glyphs['a'].length, 1);
+  assert.equal(parsed.glyphs['b'].length, 1);
+});
+
+test('14. Profile Validation: Rejects malformed profile schema and corrupt coordinates', async () => {
+  const { createNewProfile, validateAndParseProfile } = await import('../handwriting/profileStorage.ts');
+  const { createStarterSample } = await import('../handwriting/defaultGlyphs.ts');
+
+  const profile = createNewProfile('Corrupt Profile');
+  profile.glyphs['x'] = [createStarterSample('x')];
+
+  // 1. Unsupported schema version
+  const corruptVersion = JSON.parse(JSON.stringify(profile));
+  corruptVersion.schemaVersion = 99;
+  const res1 = validateAndParseProfile(JSON.stringify(corruptVersion));
+  assert.ok(res1.error?.includes('Unsupported profile schema version'));
+
+  // 2. Corrupt stroke coordinate (NaN)
+  const corruptCoords = JSON.parse(JSON.stringify(profile));
+  corruptCoords.glyphs['x'][0].strokes[0].points[0].x = NaN;
+  const res2 = validateAndParseProfile(JSON.stringify(corruptCoords));
+  assert.ok(res2.error?.includes('invalid coordinates or pressure'));
+
+  // 3. Out-of-bounds pressure (2.5)
+  const corruptPressure = JSON.parse(JSON.stringify(profile));
+  corruptPressure.glyphs['x'][0].strokes[0].points[0].pressure = 2.5;
+  const res3 = validateAndParseProfile(JSON.stringify(corruptPressure));
+  assert.ok(res3.error?.includes('invalid coordinates or pressure'));
+});
+
+// -------------------------------------------------------------
+// 9. Handwriting Layout & Sample Renderer
+// -------------------------------------------------------------
+test('15. Layout Engine: Missing-character detection without silent font substitution', async () => {
+  const { createNewProfile } = await import('../handwriting/profileStorage.ts');
+  const { createStarterSample } = await import('../handwriting/defaultGlyphs.ts');
+  const { layoutTextWithProfile } = await import('../handwriting/textLayout.ts');
+
+  // Profile containing only 'a', 'b', and 'c'
+  const sparseProfile = createNewProfile('Sparse');
+  sparseProfile.glyphs['a'] = [createStarterSample('a')];
+  sparseProfile.glyphs['b'] = [createStarterSample('b')];
+  sparseProfile.glyphs['c'] = [createStarterSample('c')];
+
+  const pages = layoutTextWithProfile('abc def', sparseProfile, {
+    pageWidth: 595,
+    pageHeight: 842,
+    margins: { top: 40, right: 40, bottom: 40, left: 40 },
+    fontSize: 24,
+    lineHeight: 1.5,
+    letterSpacing: 1.0,
+    wordSpacing: 1.0,
+  });
+
+  assert.equal(pages.length, 1);
+  const missing = pages[0].missingChars;
+  assert.ok(missing.includes('d'), 'Missing character d must be detected');
+  assert.ok(missing.includes('e'), 'Missing character e must be detected');
+  assert.ok(missing.includes('f'), 'Missing character f must be detected');
+
+  // Verify missing glyphs are explicitly tagged isMissing === true
+  const lineGlyphs = pages[0].lines[0].glyphs;
+  const missingGlyphD = lineGlyphs.find((g) => g.char === 'd');
+  assert.ok(missingGlyphD, 'Glyph d must exist in line');
+  assert.equal(missingGlyphD?.isMissing, true, 'Glyph d must be flagged isMissing');
+
+  const presentGlyphA = lineGlyphs.find((g) => g.char === 'a');
+  assert.equal(presentGlyphA?.isMissing, false, 'Glyph a must not be flagged isMissing');
+});
+
+test('16. Layout Engine: Preserves exact character order, punctuation, and paragraphs', async () => {
+  const { createNewProfile } = await import('../handwriting/profileStorage.ts');
+  const { populateStarterAlphabet } = await import('../handwriting/defaultGlyphs.ts');
+  const { layoutTextWithProfile } = await import('../handwriting/textLayout.ts');
+
+  const profile = createNewProfile('Full');
+  profile.glyphs = populateStarterAlphabet();
+
+  const inputText = 'Hello, world!\n\nSecond paragraph.';
+  const pages = layoutTextWithProfile(inputText, profile, {
+    pageWidth: 595,
+    pageHeight: 842,
+    margins: { top: 40, right: 40, bottom: 40, left: 40 },
+    fontSize: 24,
+    lineHeight: 1.5,
+    letterSpacing: 1.0,
+    wordSpacing: 1.0,
+  });
+
+  assert.equal(pages.length, 1);
+  const lines = pages[0].lines;
+  assert.ok(lines.length >= 2, 'Paragraph break must yield distinct lines');
+
+  // Verify first line characters match "Hello, world!"
+  const firstLineText = lines[0].glyphs.map((g) => g.char).join('');
+  assert.equal(firstLineText, 'Hello,world!');
+
+  // Verify second line characters match "Second paragraph."
+  const secondLineText = lines[1].glyphs.map((g) => g.char).join('');
+  assert.equal(secondLineText, 'Secondparagraph.');
+});
+
+test('17. Deterministic Sample Selection: Repeated runs select identical samples', async () => {
+  const { createNewProfile } = await import('../handwriting/profileStorage.ts');
+  const { createStarterSample } = await import('../handwriting/defaultGlyphs.ts');
+  const { layoutTextWithProfile } = await import('../handwriting/textLayout.ts');
+
+  const profile = createNewProfile('Multi-Sample');
+  // Add 3 variations for letter 'e'
+  const sample1 = { ...createStarterSample('e'), id: 'e_var_1' };
+  const sample2 = { ...createStarterSample('e'), id: 'e_var_2' };
+  const sample3 = { ...createStarterSample('e'), id: 'e_var_3' };
+  profile.glyphs['e'] = [sample1, sample2, sample3];
+
+  const text = 'exercise eleven everywhere element';
+  const options = {
+    pageWidth: 595,
+    pageHeight: 842,
+    margins: { top: 40, right: 40, bottom: 40, left: 40 },
+    fontSize: 24,
+    lineHeight: 1.5,
+    letterSpacing: 1.0,
+    wordSpacing: 1.0,
+  };
+
+  const run1 = layoutTextWithProfile(text, profile, options);
+  const run2 = layoutTextWithProfile(text, profile, options);
+
+  const sampleIndices1 = run1[0].lines[0].glyphs
+    .filter((g) => g.char === 'e')
+    .map((g) => g.sampleIndex);
+  const sampleIndices2 = run2[0].lines[0].glyphs
+    .filter((g) => g.char === 'e')
+    .map((g) => g.sampleIndex);
+
+  assert.deepEqual(
+    sampleIndices1,
+    sampleIndices2,
+    'Deterministic sample selection must produce identical sample indices on every run'
+  );
+});
+
+test('18. Pagination & Wrapping: Long text wraps and paginates with zero dropped characters', async () => {
+  const { createNewProfile } = await import('../handwriting/profileStorage.ts');
+  const { populateStarterAlphabet } = await import('../handwriting/defaultGlyphs.ts');
+  const { layoutTextWithProfile } = await import('../handwriting/textLayout.ts');
+
+  const profile = createNewProfile('Pagination Test');
+  profile.glyphs = populateStarterAlphabet();
+
+  // Create text that comfortably spans multiple pages with compact page height
+  const words = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta'];
+  const longParagraph = words.join(' ') + '. ';
+  const fullText = Array(15).fill(longParagraph).join('\n\n');
+
+  // Small page height to force multiple pages
+  const pages = layoutTextWithProfile(fullText, profile, {
+    pageWidth: 400,
+    pageHeight: 300,
+    margins: { top: 30, right: 30, bottom: 30, left: 30 },
+    fontSize: 20,
+    lineHeight: 1.5,
+    letterSpacing: 1.0,
+    wordSpacing: 1.0,
+  });
+
+  assert.ok(pages.length > 2, `Expected multiple pages, got ${pages.length}`);
+
+  // Count non-whitespace characters across all pages
+  let laidOutCharCount = 0;
+  for (const page of pages) {
+    for (const line of page.lines) {
+      laidOutCharCount += line.glyphs.length;
+    }
+  }
+
+  const expectedCharCount = fullText.replace(/\s+/g, '').length;
+  assert.equal(
+    laidOutCharCount,
+    expectedCharCount,
+    `Total laid out characters (${laidOutCharCount}) must match input text non-whitespace characters (${expectedCharCount})`
+  );
+});
+
