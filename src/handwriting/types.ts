@@ -15,6 +15,7 @@ export interface CharacterSample {
   baselineY: number;
   capHeightY: number;
   xHeightY: number;
+  isStarter?: boolean;
 }
 
 export interface HandwritingProfile {
@@ -25,7 +26,19 @@ export interface HandwritingProfile {
   createdAt: number;
   updatedAt: number;
   description?: string;
+  isDemo?: boolean;
   glyphs: Record<string, CharacterSample[]>;
+}
+
+export interface ComposerDocument {
+  schemaVersion: 1;
+  id: string;
+  title: string;
+  text: string;
+  profileId: string;
+  options: LayoutOptions;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface NormalizedGlyphSample {

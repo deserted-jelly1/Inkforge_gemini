@@ -532,3 +532,330 @@ test('18. Pagination & Wrapping: Long text wraps and paginates with zero dropped
   );
 });
 
+// -------------------------------------------------------------
+// 10. Genuinely Personal Profiles & Demo Separation
+// -------------------------------------------------------------
+test('19. Personal Profiles: New personal profiles start empty; composing "abc" with only "a" flags "b" and "c"', async () => {
+  const { createNewPersonalProfile, createDemoProfile } = await import('../handwriting/profileStorage.ts');
+  const { createStarterSample } = await import('../handwriting/defaultGlyphs.ts');
+  const { layoutTextWithProfile } = await import('../handwriting/textLayout.ts');
+
+  // 1. Personal profile must start completely empty
+  const personal = createNewPersonalProfile('Bob Handwriting');
+  assert.equal(personal.isDemo, false);
+  assert.equal(Object.keys(personal.glyphs).length, 0, 'New personal profile must have zero glyphs');
+
+  // 2. Demo profile must be marked isDemo: true and contain starter glyphs
+  const demo = createDemoProfile();
+  assert.equal(demo.isDemo, true);
+  assert.ok(Object.keys(demo.glyphs).length > 20, 'Demo profile should contain starter templates');
+
+  // 3. User captures only 'a' in personal profile
+  personal.glyphs['a'] = [
+    {
+      id: 'user_captured_a_1',
+      createdAt: Date.now(),
+      strokes: [
+        {
+          id: 'user_st_1',
+          points: [
+            { x: 100, y: 100, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 1 },
+            { x: 120, y: 140, pressure: 0.6, tiltX: 0, tiltY: 0, timestamp: 2 },
+          ],
+          baseWidth: 2.0,
+          color: '#0f172a',
+        },
+      ],
+      cellBounds: { minX: 100, minY: 100, maxX: 120, maxY: 140 },
+      baselineY: 140,
+      capHeightY: 60,
+      xHeightY: 100,
+      isStarter: false,
+    },
+  ];
+
+  // Compose "abc"
+  const pages = layoutTextWithProfile('abc', personal, {
+    pageWidth: 595,
+    pageHeight: 842,
+    margins: { top: 40, right: 40, bottom: 40, left: 40 },
+    fontSize: 24,
+    lineHeight: 1.5,
+    letterSpacing: 1.0,
+    wordSpacing: 1.0,
+  });
+
+  assert.equal(pages.length, 1);
+  const glyphs = pages[0].lines[0].glyphs;
+  assert.equal(glyphs.length, 3);
+
+  // 'a' must be present using user sample
+  assert.equal(glyphs[0].char, 'a');
+  assert.equal(glyphs[0].isMissing, false);
+  assert.equal(glyphs[0].normalizedSample?.sampleId, 'user_captured_a_1');
+
+  // 'b' and 'c' must be visibly flagged missing
+  assert.equal(glyphs[1].char, 'b');
+  assert.equal(glyphs[1].isMissing, true);
+  assert.equal(glyphs[2].char, 'c');
+  assert.equal(glyphs[2].isMissing, true);
+
+  assert.deepEqual(pages[0].missingChars, ['b', 'c']);
+});
+
+test('20. Profile Migration: Removes synthetic starter samples from personal profiles while preserving user samples', async () => {
+  const { migrateProfile } = await import('../handwriting/profileStorage.ts');
+  const { createStarterSample } = await import('../handwriting/defaultGlyphs.ts');
+
+  // Case A: Mixed personal profile containing both a starter sample and a user sample
+  const mixedPersonal = {
+    schemaVersion: 1 as const,
+    app: 'InkForge-HandwritingProfile' as const,
+    id: 'profile_mixed_1',
+    name: 'Mixed User Profile',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    isDemo: false,
+    glyphs: {
+      a: [
+        createStarterSample('a'), // id has '_starter'
+        {
+          id: 'user_captured_a_custom',
+          createdAt: Date.now(),
+          strokes: [],
+          cellBounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 },
+          baselineY: 140,
+          capHeightY: 60,
+          xHeightY: 100,
+        },
+      ],
+      b: [createStarterSample('b')], // only starter
+    },
+  };
+
+  const { profile: migrated, migrated: wasMigrated } = migrateProfile(mixedPersonal);
+  assert.equal(wasMigrated, true);
+
+  // Starter sample for 'a' must be removed, user sample must be preserved
+  assert.equal(migrated.glyphs['a'].length, 1);
+  assert.equal(migrated.glyphs['a'][0].id, 'user_captured_a_custom');
+
+  // 'b' had only starter sample, so 'b' is completely removed from personal glyphs
+  assert.equal(migrated.glyphs['b'], undefined);
+
+  // Case B: Demo profile is untouched
+  const demoProfile = {
+    schemaVersion: 1 as const,
+    app: 'InkForge-HandwritingProfile' as const,
+    id: 'profile_demo_starter',
+    name: 'Starter Demo',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    isDemo: true,
+    glyphs: {
+      a: [createStarterSample('a')],
+    },
+  };
+  const { migrated: demoMigrated } = migrateProfile(demoProfile);
+  assert.equal(demoMigrated, false, 'Demo profile should not be stripped of starter samples');
+});
+
+// -------------------------------------------------------------
+// 11. Composer Document Draft Persistence Model
+// -------------------------------------------------------------
+test('21. Draft Model: Serializes and preserves composer text, typography, and profile reference', () => {
+  const draft = {
+    schemaVersion: 1 as const,
+    id: 'composer_draft_active',
+    title: 'Midterm Calculus Draft',
+    text: 'Evaluate the surface flux integral over the hemisphere.',
+    profileId: 'profile_alice_123',
+    options: {
+      pageWidth: 595,
+      pageHeight: 842,
+      margins: { top: 50, right: 50, bottom: 50, left: 50 },
+      fontSize: 28,
+      lineHeight: 1.8,
+      letterSpacing: 1.1,
+      wordSpacing: 1.2,
+    },
+    createdAt: 1700000000000,
+    updatedAt: 1700000001000,
+  };
+
+  const serialized = JSON.stringify(draft);
+  const parsed = JSON.parse(serialized);
+
+  assert.equal(parsed.text, draft.text);
+  assert.equal(parsed.profileId, 'profile_alice_123');
+  assert.equal(parsed.options.fontSize, 28);
+  assert.equal(parsed.options.lineHeight, 1.8);
+  assert.equal(parsed.options.letterSpacing, 1.1);
+  assert.equal(parsed.options.wordSpacing, 1.2);
+});
+
+// -------------------------------------------------------------
+// 12. Storage Failure Separation for Profiles
+// -------------------------------------------------------------
+test('22. Profile Storage: Separates failure from empty database', async () => {
+  const { listProfiles } = await import('../handwriting/profileStorage.ts');
+
+  const originalIndexedDB = globalThis.indexedDB;
+  try {
+    // Simulate failing IndexedDB open for profile database
+    (globalThis as any).indexedDB = {
+      open: () => {
+        const req: any = {};
+        setTimeout(() => {
+          req.error = new Error('Simulated DatabaseInUse or StorageCorrupt');
+          if (req.onerror) req.onerror();
+        }, 5);
+        return req;
+      },
+    };
+
+    const res = await listProfiles();
+    assert.equal(res.status, 'error', 'Database failure must return error status, never empty or found');
+    if (res.status === 'error') {
+      assert.ok(res.error.includes('Simulated'));
+    }
+  } finally {
+    (globalThis as any).indexedDB = originalIndexedDB;
+  }
+});
+
+// -------------------------------------------------------------
+// 13. Single-Point Dots & XML Escaping
+// -------------------------------------------------------------
+test('23. XML Escaping: Safely escapes special characters for SVG', async () => {
+  const { escapeXml } = await import('../handwriting/sampleRenderer.ts');
+
+  const unescaped = '<tag key="value" & \'apostrophe\'>';
+  const escaped = escapeXml(unescaped);
+
+  assert.equal(
+    escaped,
+    '&lt;tag key=&quot;value&quot; &amp; &apos;apostrophe&apos;&gt;',
+    'All XML special characters must be escaped'
+  );
+  assert.ok(!escaped.includes('<'));
+  assert.ok(!escaped.includes('>'));
+});
+
+test('24. Stroke Geometry: Single-point strokes preserved as dots; multi-point as segments', async () => {
+  const { computeStrokeGeometry, SampleBasedHandwritingRenderer } = await import('../handwriting/sampleRenderer.ts');
+  const { createNewPersonalProfile } = await import('../handwriting/profileStorage.ts');
+
+  // Single-point dot stroke (e.g. period or dot on 'i')
+  const dotSample = {
+    char: '.',
+    sampleId: 'dot_sample',
+    advanceWidth: 40,
+    leftSideBearing: 8,
+    rightSideBearing: 10,
+    bounds: { minX: 10, minY: 10, maxX: 15, maxY: 15 },
+    strokes: [
+      {
+        baseWidth: 3.0,
+        color: '#0f172a',
+        points: [{ x: 12, y: 12, pressure: 0.8, tiltX: 0, tiltY: 0, timestamp: 100 }],
+      },
+    ],
+  };
+
+  const geoms = computeStrokeGeometry(dotSample, 50, 100, 1.0);
+  assert.equal(geoms.length, 1);
+  assert.equal(geoms[0].dots.length, 1, 'Single-point stroke must yield a dot');
+  assert.equal(geoms[0].segments.length, 0);
+  assert.equal(geoms[0].dots[0].x, 50 + 12);
+  assert.equal(geoms[0].dots[0].y, 100 + 12);
+  assert.ok(geoms[0].dots[0].radius > 0);
+
+  // Multi-point stroke
+  const lineSample = {
+    char: 'l',
+    sampleId: 'line_sample',
+    advanceWidth: 40,
+    leftSideBearing: 8,
+    rightSideBearing: 10,
+    bounds: { minX: 10, minY: 0, maxX: 10, maxY: 100 },
+    strokes: [
+      {
+        baseWidth: 2.0,
+        color: '#0f172a',
+        points: [
+          { x: 10, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 100 },
+          { x: 10, y: 100, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 200 },
+        ],
+      },
+    ],
+  };
+
+  const geomsLine = computeStrokeGeometry(lineSample, 50, 100, 1.0);
+  assert.equal(geomsLine[0].dots.length, 0);
+  assert.ok(geomsLine[0].segments.length > 0, 'Multi-point stroke must yield smoothed segments');
+
+  // Verify SVG generation includes circle for dot
+  const profile = createNewPersonalProfile('Dot Test Profile');
+  const renderer = new SampleBasedHandwritingRenderer(profile);
+  const fakePage = {
+    pageNumber: 1,
+    lines: [
+      {
+        baselineY: 100,
+        width: 100,
+        glyphs: [
+          {
+            char: '.',
+            x: 50,
+            y: 100,
+            scale: 1.0,
+            sampleIndex: 0,
+            normalizedSample: dotSample,
+            isMissing: false,
+          },
+        ],
+      },
+    ],
+    width: 200,
+    height: 200,
+    margins: { top: 20, right: 20, bottom: 20, left: 20 },
+    missingChars: [],
+  };
+
+  const svg = renderer.renderToSVG(fakePage);
+  assert.ok(svg.includes('<circle'), 'SVG must include <circle> element for single-point dot');
+});
+
+test('25. Layout Engine: Handles multiple consecutive blank lines without dropping lines', async () => {
+  const { createNewPersonalProfile } = await import('../handwriting/profileStorage.ts');
+  const { createStarterSample } = await import('../handwriting/defaultGlyphs.ts');
+  const { layoutTextWithProfile } = await import('../handwriting/textLayout.ts');
+
+  const profile = createNewPersonalProfile('Blank Paragraphs');
+  profile.glyphs['a'] = [createStarterSample('a')];
+
+  // Text with consecutive blank paragraphs
+  const text = 'a\n\n\n\na';
+  const pages = layoutTextWithProfile(text, profile, {
+    pageWidth: 595,
+    pageHeight: 842,
+    margins: { top: 40, right: 40, bottom: 40, left: 40 },
+    fontSize: 24,
+    lineHeight: 1.5,
+    letterSpacing: 1.0,
+    wordSpacing: 1.0,
+  });
+
+  assert.equal(pages.length, 1);
+  assert.equal(pages[0].lines.length, 2, 'Should contain 2 lines with character "a"');
+  // Second line baselineY should be significantly further down due to empty paragraphs
+  const line1Y = pages[0].lines[0].baselineY;
+  const line2Y = pages[0].lines[1].baselineY;
+  assert.ok(
+    line2Y - line1Y > 24 * 1.5 * 2,
+    `Line 2 baseline (${line2Y}) should be spaced past multiple blank paragraphs relative to Line 1 (${line1Y})`
+  );
+});
+
+

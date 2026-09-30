@@ -4,9 +4,101 @@ import {
   LayoutOptions,
   LayoutPage,
   HandwritingProfile,
+  NormalizedGlyphSample,
 } from './types';
 import { layoutTextWithProfile } from './textLayout';
 import { evaluateCentripetalCatmullRom, computeDynamicWidth } from '../utils/spline';
+
+export function escapeXml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+export function parseHexColor(hex: string): [number, number, number] {
+  let clean = (hex || '').replace('#', '');
+  if (clean.length === 3) {
+    clean = clean
+      .split('')
+      .map((c) => c + c)
+      .join('');
+  }
+  const num = parseInt(clean, 16);
+  if (Number.isNaN(num)) return [15, 23, 42];
+  return [(num >> 16) & 255, (num >> 8) & 255, num & 255];
+}
+
+export interface RenderSegment {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  width: number;
+}
+
+export interface RenderDot {
+  x: number;
+  y: number;
+  radius: number;
+}
+
+export interface StrokeGeometry {
+  color: string;
+  dots: RenderDot[];
+  segments: RenderSegment[];
+}
+
+/**
+ * Shared stroke geometry generator ensuring identical coordinates,
+ * pressure-dependent widths, and dot handling across canvas, SVG, and vector PDF.
+ */
+export function computeStrokeGeometry(
+  sample: NormalizedGlyphSample,
+  originX: number,
+  originY: number,
+  scale: number
+): StrokeGeometry[] {
+  const result: StrokeGeometry[] = [];
+
+  for (const stroke of sample.strokes) {
+    const dots: RenderDot[] = [];
+    const segments: RenderSegment[] = [];
+    const color = stroke.color || '#0f172a';
+
+    if (stroke.points.length === 1) {
+      // Single-point dot tap
+      const pt = stroke.points[0];
+      dots.push({
+        x: originX + pt.x * scale,
+        y: originY + pt.y * scale,
+        radius: Math.max(0.75, stroke.baseWidth * scale * 0.5),
+      });
+    } else if (stroke.points.length >= 2) {
+      const smoothed = evaluateCentripetalCatmullRom(stroke.points, 6);
+      for (let i = 0; i < smoothed.length - 1; i++) {
+        const p1 = smoothed[i];
+        const p2 = smoothed[i + 1];
+        const avgPressure = (p1.pressure + p2.pressure) * 0.5;
+        const dynWidth = computeDynamicWidth(stroke.baseWidth * scale, avgPressure, 'pen');
+
+        segments.push({
+          x1: originX + p1.x * scale,
+          y1: originY + p1.y * scale,
+          x2: originX + p2.x * scale,
+          y2: originY + p2.y * scale,
+          width: dynWidth,
+        });
+      }
+    }
+
+    result.push({ color, dots, segments });
+  }
+
+  return result;
+}
 
 export class SampleBasedHandwritingRenderer implements IHandwritingRenderer {
   readonly name = 'Sample-based handwriting — experimental';
@@ -25,17 +117,15 @@ export class SampleBasedHandwritingRenderer implements IHandwritingRenderer {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Reset transform to identity and clear
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-
     ctx.scale(scale, scale);
 
-    // 1. Pristine paper background
+    // Background paper
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, page.width, page.height);
 
-    // 2. Subtle light ruled lines across text baselines
+    // Ruled baseline guides
     ctx.strokeStyle = '#f1f5f9';
     ctx.lineWidth = 1;
     for (const line of page.lines) {
@@ -45,11 +135,10 @@ export class SampleBasedHandwritingRenderer implements IHandwritingRenderer {
       ctx.stroke();
     }
 
-    // 3. Render Characters
+    // Render Glyphs
     for (const line of page.lines) {
       for (const glyph of line.glyphs) {
         if (glyph.isMissing) {
-          // Visible missing character indicator: dashed amber frame with character label
           ctx.save();
           ctx.strokeStyle = '#f59e0b';
           ctx.setLineDash([3, 3]);
@@ -68,57 +157,56 @@ export class SampleBasedHandwritingRenderer implements IHandwritingRenderer {
         const sample = glyph.normalizedSample;
         if (!sample) continue;
 
-        ctx.save();
-        ctx.translate(glyph.x, glyph.y);
-        ctx.scale(glyph.scale, glyph.scale);
+        const geometries = computeStrokeGeometry(sample, glyph.x, glyph.y, glyph.scale);
 
-        for (const stroke of sample.strokes) {
-          if (stroke.points.length < 2) {
-            if (stroke.points.length === 1) {
-              const pt = stroke.points[0];
-              ctx.fillStyle = stroke.color || '#0f172a';
+        for (const geom of geometries) {
+          // Render dots
+          if (geom.dots.length > 0) {
+            ctx.fillStyle = geom.color;
+            for (const dot of geom.dots) {
               ctx.beginPath();
-              ctx.arc(pt.x, pt.y, stroke.baseWidth * 0.7, 0, Math.PI * 2);
+              ctx.arc(dot.x, dot.y, dot.radius, 0, Math.PI * 2);
               ctx.fill();
             }
-            continue;
           }
 
-          const smoothed = evaluateCentripetalCatmullRom(stroke.points, 6);
-          ctx.lineCap = 'round';
-          ctx.lineJoin = 'round';
-          ctx.strokeStyle = stroke.color || '#0f172a';
-
-          for (let i = 0; i < smoothed.length - 1; i++) {
-            const p1 = smoothed[i];
-            const p2 = smoothed[i + 1];
-            const avgPressure = (p1.pressure + p2.pressure) * 0.5;
-            const dynWidth = computeDynamicWidth(stroke.baseWidth, avgPressure, 'pen');
-
-            ctx.lineWidth = dynWidth;
-            ctx.beginPath();
-            ctx.moveTo(p1.x, p1.y);
-            ctx.lineTo(p2.x, p2.y);
-            ctx.stroke();
+          // Render variable-width segments
+          if (geom.segments.length > 0) {
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.strokeStyle = geom.color;
+            for (const seg of geom.segments) {
+              ctx.lineWidth = seg.width;
+              ctx.beginPath();
+              ctx.moveTo(seg.x1, seg.y1);
+              ctx.lineTo(seg.x2, seg.y2);
+              ctx.stroke();
+            }
           }
         }
-
-        ctx.restore();
       }
     }
   }
 
   renderToSVG(page: LayoutPage): string {
-    const paths: string[] = [];
+    const elements: string[] = [];
+
+    // Ruled lines in SVG
+    for (const line of page.lines) {
+      elements.push(
+        `<line x1="${page.margins.left.toFixed(2)}" y1="${line.baselineY.toFixed(2)}" x2="${(page.width - page.margins.right).toFixed(2)}" y2="${line.baselineY.toFixed(2)}" stroke="#f1f5f9" stroke-width="1"/>`
+      );
+    }
 
     for (const line of page.lines) {
       for (const glyph of line.glyphs) {
         if (glyph.isMissing) {
           const boxW = Math.max(14, 18 * glyph.scale);
           const boxH = Math.max(18, 24 * glyph.scale);
-          paths.push(
+          const safeChar = escapeXml(glyph.char);
+          elements.push(
             `<rect x="${glyph.x.toFixed(2)}" y="${(glyph.y - boxH).toFixed(2)}" width="${boxW.toFixed(2)}" height="${boxH.toFixed(2)}" fill="none" stroke="#f59e0b" stroke-dasharray="3,3" stroke-width="1"/>` +
-            `<text x="${(glyph.x + 3).toFixed(2)}" y="${(glyph.y - 4).toFixed(2)}" fill="#b45309" font-size="${Math.round(12 * glyph.scale)}">${glyph.char}</text>`
+            `<text x="${(glyph.x + 3).toFixed(2)}" y="${(glyph.y - 4).toFixed(2)}" fill="#b45309" font-family="sans-serif" font-size="${Math.round(12 * glyph.scale)}">${safeChar}</text>`
           );
           continue;
         }
@@ -126,22 +214,22 @@ export class SampleBasedHandwritingRenderer implements IHandwritingRenderer {
         const sample = glyph.normalizedSample;
         if (!sample) continue;
 
-        for (const stroke of sample.strokes) {
-          if (stroke.points.length < 2) continue;
-          const smoothed = evaluateCentripetalCatmullRom(stroke.points, 6);
+        const geometries = computeStrokeGeometry(sample, glyph.x, glyph.y, glyph.scale);
 
-          let d = '';
-          for (let i = 0; i < smoothed.length; i++) {
-            const sx = (glyph.x + smoothed[i].x * glyph.scale).toFixed(2);
-            const sy = (glyph.y + smoothed[i].y * glyph.scale).toFixed(2);
-            d += i === 0 ? `M ${sx} ${sy}` : ` L ${sx} ${sy}`;
+        for (const geom of geometries) {
+          // Dots preserved in SVG
+          for (const dot of geom.dots) {
+            elements.push(
+              `<circle cx="${dot.x.toFixed(2)}" cy="${dot.y.toFixed(2)}" r="${dot.radius.toFixed(2)}" fill="${geom.color}"/>`
+            );
           }
 
-          const strokeWidth = (stroke.baseWidth * glyph.scale).toFixed(2);
-          const color = stroke.color || '#0f172a';
-          paths.push(
-            `<path d="${d}" fill="none" stroke="${color}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round"/>`
-          );
+          // Segments with pressure-dependent width in SVG
+          for (const seg of geom.segments) {
+            elements.push(
+              `<line x1="${seg.x1.toFixed(2)}" y1="${seg.y1.toFixed(2)}" x2="${seg.x2.toFixed(2)}" y2="${seg.y2.toFixed(2)}" stroke="${geom.color}" stroke-width="${seg.width.toFixed(2)}" stroke-linecap="round"/>`
+            );
+          }
         }
       }
     }
@@ -149,13 +237,14 @@ export class SampleBasedHandwritingRenderer implements IHandwritingRenderer {
     return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${page.width} ${page.height}" width="${page.width}pt" height="${page.height}pt">
   <rect width="100%" height="100%" fill="#ffffff"/>
-  ${paths.join('\n  ')}
+  ${elements.join('\n  ')}
 </svg>`;
   }
 }
 
 /**
- * Exports multiple rendered pages into a downloadable multipage PDF.
+ * Exports multiple rendered pages into a genuine vector PDF.
+ * Uses native vector line, circle, rect, and text PDF commands.
  */
 export function exportPagesToPDF(
   pages: LayoutPage[],
@@ -171,15 +260,69 @@ export function exportPagesToPDF(
     format: [firstPage.width, firstPage.height],
   });
 
-  const tempCanvas = document.createElement('canvas');
-
-  for (let i = 0; i < pages.length; i++) {
-    if (i > 0) {
-      pdf.addPage([pages[i].width, pages[i].height], pages[i].width > pages[i].height ? 'landscape' : 'portrait');
+  for (let pIdx = 0; pIdx < pages.length; pIdx++) {
+    const page = pages[pIdx];
+    if (pIdx > 0) {
+      pdf.addPage(
+        [page.width, page.height],
+        page.width > page.height ? 'landscape' : 'portrait'
+      );
     }
-    renderer.renderToCanvas(pages[i], tempCanvas, 2);
-    const imgData = tempCanvas.toDataURL('image/jpeg', 0.95);
-    pdf.addImage(imgData, 'JPEG', 0, 0, pages[i].width, pages[i].height);
+
+    // Background
+    pdf.setFillColor(255, 255, 255);
+    pdf.rect(0, 0, page.width, page.height, 'F');
+
+    // Vector ruled baseline lines
+    pdf.setDrawColor(241, 245, 249);
+    pdf.setLineDashPattern([], 0);
+    pdf.setLineWidth(0.75);
+    for (const line of page.lines) {
+      pdf.line(page.margins.left, line.baselineY, page.width - page.margins.right, line.baselineY);
+    }
+
+    // Vector Glyphs
+    for (const line of page.lines) {
+      for (const glyph of line.glyphs) {
+        if (glyph.isMissing) {
+          const boxW = Math.max(14, 18 * glyph.scale);
+          const boxH = Math.max(18, 24 * glyph.scale);
+
+          pdf.setDrawColor(245, 158, 11);
+          pdf.setLineDashPattern([2, 2], 0);
+          pdf.setLineWidth(0.75);
+          pdf.rect(glyph.x, glyph.y - boxH, boxW, boxH, 'S');
+
+          pdf.setTextColor(180, 83, 9);
+          pdf.setFontSize(Math.max(8, Math.round(10 * glyph.scale)));
+          pdf.text(glyph.char, glyph.x + 3, glyph.y - 4);
+          continue;
+        }
+
+        const sample = glyph.normalizedSample;
+        if (!sample) continue;
+
+        const geometries = computeStrokeGeometry(sample, glyph.x, glyph.y, glyph.scale);
+
+        for (const geom of geometries) {
+          const [r, g, b] = parseHexColor(geom.color);
+          pdf.setFillColor(r, g, b);
+          pdf.setDrawColor(r, g, b);
+          pdf.setLineDashPattern([], 0);
+
+          // Vector dots
+          for (const dot of geom.dots) {
+            pdf.circle(dot.x, dot.y, dot.radius, 'F');
+          }
+
+          // Vector line segments
+          for (const seg of geom.segments) {
+            pdf.setLineWidth(Math.max(0.5, seg.width));
+            pdf.line(seg.x1, seg.y1, seg.x2, seg.y2);
+          }
+        }
+      }
+    }
   }
 
   const safeTitle = documentTitle.replace(/[^a-zA-Z0-9_-]/g, '_');

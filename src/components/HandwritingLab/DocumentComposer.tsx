@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { HandwritingProfile, LayoutOptions } from '../../handwriting/types';
+import { HandwritingProfile, LayoutOptions, ComposerDocument } from '../../handwriting/types';
 import { SampleBasedHandwritingRenderer, exportPagesToPDF } from '../../handwriting/sampleRenderer';
 import {
   FileText,
@@ -9,14 +9,19 @@ import {
   ChevronLeft,
   ChevronRight,
   Sliders,
-  Sparkles,
+  RotateCw,
+  CheckCircle2,
 } from 'lucide-react';
 
 interface DocumentComposerProps {
-  profile: HandwritingProfile;
+  profile: HandwritingProfile | null;
+  draft: ComposerDocument;
+  onUpdateDraft: (updated: ComposerDocument) => void;
+  draftSaveStatus: 'idle' | 'saving' | 'error';
+  onRetrySaveDraft: () => void;
 }
 
-const PRESET_TEXTS = [
+export const PRESET_TEXTS = [
   {
     name: 'Calculus III Study Summary',
     text: `Stokes' Theorem relates the surface integral of the curl of a vector field over a surface to the line integral of the vector field over its boundary curve.
@@ -42,41 +47,43 @@ Milestone 3: Export vector SVG and multipage PDF documents for print and revisio
   },
 ];
 
-export const DocumentComposer: React.FC<DocumentComposerProps> = ({ profile }) => {
-  const [inputText, setInputText] = useState<string>(PRESET_TEXTS[0].text);
+export const DocumentComposer: React.FC<DocumentComposerProps> = ({
+  profile,
+  draft,
+  onUpdateDraft,
+  draftSaveStatus,
+  onRetrySaveDraft,
+}) => {
   const [currentPageIndex, setCurrentPageIndex] = useState<number>(0);
-
-  // Typography controls
-  const [fontSize, setFontSize] = useState<number>(24);
-  const [lineHeight, setLineHeight] = useState<number>(1.5);
-  const [letterSpacing, setLetterSpacing] = useState<number>(1.0);
-  const [wordSpacing, setWordSpacing] = useState<number>(1.0);
-
+  const [exportError, setExportError] = useState<string | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Standard A4 dimensions in pt (595 x 842 pt)
-  const layoutOptions: LayoutOptions = useMemo(
-    () => ({
-      pageWidth: 595,
-      pageHeight: 842,
-      margins: { top: 48, right: 48, bottom: 48, left: 48 },
-      fontSize,
-      lineHeight,
-      letterSpacing,
-      wordSpacing,
-    }),
-    [fontSize, lineHeight, letterSpacing, wordSpacing]
+  // Fallback empty profile if no profile is active
+  const effectiveProfile: HandwritingProfile = useMemo(() => {
+    if (profile) return profile;
+    return {
+      schemaVersion: 1,
+      app: 'InkForge-HandwritingProfile',
+      id: 'empty_fallback',
+      name: 'No Profile Selected',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      glyphs: {},
+    };
+  }, [profile]);
+
+  // Renderer instance
+  const renderer = useMemo(
+    () => new SampleBasedHandwritingRenderer(effectiveProfile),
+    [effectiveProfile]
   );
 
-  // Instantiate renderer with current profile
-  const renderer = useMemo(() => new SampleBasedHandwritingRenderer(profile), [profile]);
-
-  // Compute paginated layout
+  // Compute paginated layout using draft options
   const pages = useMemo(() => {
-    return renderer.layoutText(inputText, layoutOptions);
-  }, [renderer, inputText, layoutOptions]);
+    return renderer.layoutText(draft.text, draft.options);
+  }, [renderer, draft.text, draft.options]);
 
-  // Ensure current page index is valid
+  // Adjust page index when page count changes
   useEffect(() => {
     if (currentPageIndex >= pages.length) {
       setCurrentPageIndex(Math.max(0, pages.length - 1));
@@ -102,38 +109,107 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({ profile }) =
     return Array.from(set);
   }, [pages]);
 
+  // Handlers for draft mutations
+  const handleTextChange = (newText: string) => {
+    onUpdateDraft({
+      ...draft,
+      text: newText,
+      updatedAt: Date.now(),
+    });
+  };
+
+  const handleOptionChange = (key: keyof LayoutOptions, val: number) => {
+    onUpdateDraft({
+      ...draft,
+      options: {
+        ...draft.options,
+        [key]: val,
+      },
+      updatedAt: Date.now(),
+    });
+  };
+
+  const handleApplyPreset = (presetText: string) => {
+    if (draft.text.trim().length > 0 && draft.text !== presetText) {
+      const confirmReplace = window.confirm(
+        'Replace current draft text with preset? Your custom changes in this draft will be overwritten.'
+      );
+      if (!confirmReplace) return;
+    }
+    handleTextChange(presetText);
+  };
+
   // Export SVG of current page
   const handleExportSVG = () => {
-    if (!activePage) return;
-    const svgString = renderer.renderToSVG(activePage);
-    const blob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `InkForge_Handwriting_Page_${activePage.pageNumber}.svg`;
-    a.click();
-    URL.revokeObjectURL(url);
+    setExportError(null);
+    try {
+      if (!activePage) return;
+      const svgString = renderer.renderToSVG(activePage);
+      const blob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `InkForge_Handwriting_Page_${activePage.pageNumber}.svg`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      setExportError(`Export SVG failed: ${err.message || 'Unknown error'}`);
+    }
   };
 
   // Export Multipage PDF
   const handleExportPDF = () => {
-    if (pages.length === 0) return;
-    exportPagesToPDF(pages, renderer, `${profile.name}_Document`);
+    setExportError(null);
+    try {
+      if (pages.length === 0) return;
+      exportPagesToPDF(pages, renderer, `${effectiveProfile.name}_Document`);
+    } catch (err: any) {
+      setExportError(`Export PDF failed: ${err.message || 'Unknown error'}`);
+    }
   };
 
   return (
     <div className="flex-1 flex overflow-hidden bg-neutral-100 text-neutral-800 text-xs">
       {/* Left: Input Text Editor & Typography Controls */}
-      <div className="w-[420px] border-r border-neutral-200 bg-white flex flex-col shrink-0 overflow-hidden">
-        {/* Presets and Status */}
+      <div className="w-[430px] border-r border-neutral-200 bg-white flex flex-col shrink-0 overflow-hidden">
+        {/* Presets and Save Status */}
         <div className="p-3 border-b border-neutral-200 space-y-2">
           <div className="flex items-center justify-between">
-            <span className="font-semibold text-neutral-900 text-sm">Document Composer</span>
+            <div className="flex items-center gap-2">
+              <span className="font-semibold text-neutral-900 text-sm">Composer Draft</span>
+
+              {/* Draft Save Status Indicator */}
+              {draftSaveStatus === 'saving' && (
+                <div className="flex items-center gap-1 text-[11px] text-neutral-500 font-mono">
+                  <RotateCw className="w-3 h-3 animate-spin text-indigo-500" />
+                  <span>Saving draft...</span>
+                </div>
+              )}
+              {draftSaveStatus === 'idle' && (
+                <div className="flex items-center gap-1 text-[11px] text-emerald-600 font-mono">
+                  <CheckCircle2 className="w-3 h-3" />
+                  <span>Saved locally</span>
+                </div>
+              )}
+              {draftSaveStatus === 'error' && (
+                <div className="flex items-center gap-1 text-[11px] text-rose-600 font-mono">
+                  <AlertTriangle className="w-3 h-3" />
+                  <span>Save failed</span>
+                  <button
+                    onClick={onRetrySaveDraft}
+                    className="underline hover:text-rose-700 font-medium ml-0.5"
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+            </div>
+
             <div className="flex items-center gap-1">
               {PRESET_TEXTS.map((preset, idx) => (
                 <button
                   key={idx}
-                  onClick={() => setInputText(preset.text)}
+                  onClick={() => handleApplyPreset(preset.text)}
                   className="px-2 py-0.5 rounded text-[11px] bg-neutral-100 hover:bg-neutral-200 text-neutral-700 transition-colors"
                   title={preset.name}
                 >
@@ -144,15 +220,15 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({ profile }) =
           </div>
 
           <p className="text-[11px] text-neutral-500 leading-relaxed">
-            Type any new text below. Words are dynamically assembled from your captured character glyphs.
+            Your draft text and typography are automatically preserved. Composed words use the currently selected profile: <strong>{effectiveProfile.name}</strong>.
           </p>
         </div>
 
         {/* Text Area */}
         <div className="flex-1 p-3 flex flex-col">
           <textarea
-            value={inputText}
-            onChange={(e) => setInputText(e.target.value)}
+            value={draft.text}
+            onChange={(e) => handleTextChange(e.target.value)}
             placeholder="Type your notes or document text here..."
             className="w-full flex-1 p-3 bg-neutral-50 border border-neutral-200 rounded-lg text-xs font-mono text-neutral-800 focus:outline-none focus:border-indigo-500 focus:bg-white resize-none leading-relaxed transition-colors"
           />
@@ -169,15 +245,15 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({ profile }) =
             <div>
               <div className="flex justify-between text-neutral-500 mb-1">
                 <span>Font Size</span>
-                <span className="font-mono">{fontSize}pt</span>
+                <span className="font-mono">{draft.options.fontSize}pt</span>
               </div>
               <input
                 type="range"
                 min="18"
                 max="40"
                 step="1"
-                value={fontSize}
-                onChange={(e) => setFontSize(parseInt(e.target.value))}
+                value={draft.options.fontSize}
+                onChange={(e) => handleOptionChange('fontSize', parseInt(e.target.value))}
                 className="w-full h-1 bg-neutral-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
               />
             </div>
@@ -185,15 +261,15 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({ profile }) =
             <div>
               <div className="flex justify-between text-neutral-500 mb-1">
                 <span>Line Height</span>
-                <span className="font-mono">{lineHeight}x</span>
+                <span className="font-mono">{draft.options.lineHeight}x</span>
               </div>
               <input
                 type="range"
                 min="1.2"
                 max="2.2"
                 step="0.1"
-                value={lineHeight}
-                onChange={(e) => setLineHeight(parseFloat(e.target.value))}
+                value={draft.options.lineHeight}
+                onChange={(e) => handleOptionChange('lineHeight', parseFloat(e.target.value))}
                 className="w-full h-1 bg-neutral-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
               />
             </div>
@@ -201,15 +277,15 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({ profile }) =
             <div>
               <div className="flex justify-between text-neutral-500 mb-1">
                 <span>Letter Spacing</span>
-                <span className="font-mono">{letterSpacing.toFixed(1)}x</span>
+                <span className="font-mono">{draft.options.letterSpacing.toFixed(1)}x</span>
               </div>
               <input
                 type="range"
                 min="0.8"
                 max="1.5"
                 step="0.05"
-                value={letterSpacing}
-                onChange={(e) => setLetterSpacing(parseFloat(e.target.value))}
+                value={draft.options.letterSpacing}
+                onChange={(e) => handleOptionChange('letterSpacing', parseFloat(e.target.value))}
                 className="w-full h-1 bg-neutral-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
               />
             </div>
@@ -217,15 +293,15 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({ profile }) =
             <div>
               <div className="flex justify-between text-neutral-500 mb-1">
                 <span>Word Spacing</span>
-                <span className="font-mono">{wordSpacing.toFixed(1)}x</span>
+                <span className="font-mono">{draft.options.wordSpacing.toFixed(1)}x</span>
               </div>
               <input
                 type="range"
                 min="0.8"
                 max="2.0"
                 step="0.1"
-                value={wordSpacing}
-                onChange={(e) => setWordSpacing(parseFloat(e.target.value))}
+                value={draft.options.wordSpacing}
+                onChange={(e) => handleOptionChange('wordSpacing', parseFloat(e.target.value))}
                 className="w-full h-1 bg-neutral-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
               />
             </div>
@@ -246,7 +322,7 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({ profile }) =
           </div>
 
           <div className="flex items-center gap-2">
-            {/* Pagination Buttons */}
+            {/* Pagination Controls */}
             <div className="flex items-center gap-1 mr-2 border-r border-neutral-200 pr-2">
               <button
                 onClick={() => setCurrentPageIndex((idx) => Math.max(0, idx - 1))}
@@ -276,24 +352,40 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({ profile }) =
               <span>Export SVG</span>
             </button>
 
-            {/* Multipage PDF Export */}
+            {/* Genuine Vector PDF Export */}
             <button
               onClick={handleExportPDF}
               className="flex items-center gap-1.5 px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-700 text-white font-medium transition-colors shadow-xs"
-              title="Export complete document as multipage PDF"
+              title="Export complete document as genuine vector PDF"
             >
               <Download className="w-3.5 h-3.5" />
-              <span>Export PDF ({pages.length}p)</span>
+              <span>Export Vector PDF ({pages.length}p)</span>
             </button>
           </div>
         </div>
+
+        {/* Visible Export Failure Banner */}
+        {exportError && (
+          <div className="bg-rose-50 border-b border-rose-200 px-4 py-2 flex items-center justify-between text-xs text-rose-800">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>{exportError}</span>
+            </div>
+            <button
+              onClick={() => setExportError(null)}
+              className="underline text-rose-600 hover:text-rose-800 text-[11px]"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
 
         {/* Missing Characters Alert Banner */}
         {allMissingChars.length > 0 && (
           <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 flex items-center gap-2 text-amber-800 text-[11px]">
             <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
             <span>
-              <strong>Missing characters in profile:</strong>{' '}
+              <strong>Missing characters in profile &quot;{effectiveProfile.name}&quot;:</strong>{' '}
               {allMissingChars.map((c) => (
                 <span
                   key={c}
@@ -302,7 +394,7 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({ profile }) =
                   {c === ' ' ? 'space' : c}
                 </span>
               ))}
-              (shown in dashed amber boxes in preview)
+              (highlighted in dashed amber boxes in preview)
             </span>
           </div>
         )}
@@ -313,8 +405,8 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({ profile }) =
             <canvas
               ref={canvasRef}
               style={{
-                width: `${layoutOptions.pageWidth}px`,
-                height: `${layoutOptions.pageHeight}px`,
+                width: `${draft.options.pageWidth}px`,
+                height: `${draft.options.pageHeight}px`,
               }}
               className="block bg-white rounded-md"
             />

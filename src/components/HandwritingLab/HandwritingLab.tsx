@@ -1,77 +1,207 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { HandwritingProfile } from '../../handwriting/types';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { HandwritingProfile, ComposerDocument } from '../../handwriting/types';
 import {
   listProfiles,
   saveProfile,
-  loadProfile,
   deleteProfile,
-  createNewProfile,
+  createNewPersonalProfile,
+  createDemoProfile,
   validateAndParseProfile,
+  loadActiveDraft,
+  saveActiveDraft,
 } from '../../handwriting/profileStorage';
-import { populateStarterAlphabet } from '../../handwriting/defaultGlyphs';
+import { PRESET_TEXTS } from './DocumentComposer';
 import { ProfileManager } from './ProfileManager';
 import { CaptureStudio } from './CaptureStudio';
 import { DocumentComposer } from './DocumentComposer';
-import { Info, Sparkles, PenTool, FileText, AlertCircle, X } from 'lucide-react';
+import { Info, PenTool, FileText, AlertCircle, X, RefreshCw } from 'lucide-react';
 
 export const HandwritingLab: React.FC = () => {
   const [profiles, setProfiles] = useState<HandwritingProfile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState<string>('');
-  const [activeLabTab, setActiveLabTab] = useState<'capture' | 'compose'>('compose');
+  const [activeLabTab, setActiveLabTab] = useState<'compose' | 'capture'>('compose');
+
+  // Draft persistence state
+  const [draft, setDraft] = useState<ComposerDocument>({
+    schemaVersion: 1,
+    id: 'composer_draft_active',
+    title: 'Handwriting Draft',
+    text: PRESET_TEXTS[0].text,
+    profileId: '',
+    options: {
+      pageWidth: 595,
+      pageHeight: 842,
+      margins: { top: 48, right: 48, bottom: 48, left: 48 },
+      fontSize: 24,
+      lineHeight: 1.5,
+      letterSpacing: 1.0,
+      wordSpacing: 1.0,
+    },
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+
+  const [draftSaveStatus, setDraftSaveStatus] = useState<'idle' | 'saving' | 'error'>('idle');
+  const [profileLoadError, setProfileLoadError] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const [isLoaded, setIsLoaded] = useState<boolean>(false);
 
-  // Load profiles on mount
-  useEffect(() => {
-    listProfiles().then((loaded) => {
-      if (loaded.length > 0) {
-        setProfiles(loaded);
-        setActiveProfileId(loaded[0].id);
-      } else {
-        // Create initial starter profile
-        const starter = createNewProfile('My Print Handwriting');
-        starter.glyphs = populateStarterAlphabet();
-        saveProfile(starter).then(() => {
-          setProfiles([starter]);
-          setActiveProfileId(starter.id);
-        });
+  // Debounce refs for draft and profile autosaves
+  const draftSaveTimeoutRef = useRef<any>(null);
+  const draftSaveSeqRef = useRef<number>(0);
+  const pendingDraftRef = useRef<ComposerDocument>(draft);
+
+  // Load profiles and draft on mount
+  const loadLabData = useCallback(async () => {
+    setProfileLoadError(null);
+    setIsLoaded(false);
+
+    try {
+      const profileRes = await listProfiles();
+      let loadedProfiles: HandwritingProfile[] = [];
+
+      if (profileRes.status === 'found') {
+        loadedProfiles = profileRes.profiles;
+      } else if (profileRes.status === 'empty') {
+        // Initialize starter demo profile and an empty personal profile
+        const demo = createDemoProfile();
+        const initialPersonal = createNewPersonalProfile('My Handwriting');
+        await saveProfile(demo);
+        await saveProfile(initialPersonal);
+        loadedProfiles = [demo, initialPersonal];
+      } else if (profileRes.status === 'error') {
+        setProfileLoadError(profileRes.error);
+        setIsLoaded(true);
+        return;
       }
+
+      setProfiles(loadedProfiles);
+      // Select the personal profile by default if present, else first profile
+      const defaultPersonal = loadedProfiles.find((p) => !p.isDemo) || loadedProfiles[0];
+      const initialActiveId = defaultPersonal ? defaultPersonal.id : '';
+      setActiveProfileId(initialActiveId);
+
+      // Load active composer draft from IndexedDB
+      const draftRes = await loadActiveDraft();
+      if (draftRes.status === 'found') {
+        setDraft(draftRes.draft);
+        pendingDraftRef.current = draftRes.draft;
+        if (draftRes.draft.profileId && loadedProfiles.some((p) => p.id === draftRes.draft.profileId)) {
+          setActiveProfileId(draftRes.draft.profileId);
+        }
+      } else {
+        // Create initial draft
+        const initDraft: ComposerDocument = {
+          schemaVersion: 1,
+          id: 'composer_draft_active',
+          title: 'Handwriting Draft',
+          text: PRESET_TEXTS[0].text,
+          profileId: initialActiveId,
+          options: {
+            pageWidth: 595,
+            pageHeight: 842,
+            margins: { top: 48, right: 48, bottom: 48, left: 48 },
+            fontSize: 24,
+            lineHeight: 1.5,
+            letterSpacing: 1.0,
+            wordSpacing: 1.0,
+          },
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+        setDraft(initDraft);
+        pendingDraftRef.current = initDraft;
+        saveActiveDraft(initDraft).catch(console.error);
+      }
+
       setIsLoaded(true);
-    });
+    } catch (err: any) {
+      setProfileLoadError(err?.message || 'Failed initializing Handwriting Lab storage.');
+      setIsLoaded(true);
+    }
   }, []);
 
-  const activeProfile =
-    profiles.find((p) => p.id === activeProfileId) || profiles[0];
+  useEffect(() => {
+    loadLabData();
+  }, [loadLabData]);
 
+  // Debounced draft autosave
+  const triggerDraftSave = useCallback((updatedDraft: ComposerDocument) => {
+    setDraft(updatedDraft);
+    pendingDraftRef.current = updatedDraft;
+    setDraftSaveStatus('saving');
+
+    const currentSeq = ++draftSaveSeqRef.current;
+    if (draftSaveTimeoutRef.current) {
+      clearTimeout(draftSaveTimeoutRef.current);
+    }
+
+    draftSaveTimeoutRef.current = setTimeout(() => {
+      saveActiveDraft(pendingDraftRef.current)
+        .then(() => {
+          if (currentSeq >= draftSaveSeqRef.current) {
+            setDraftSaveStatus('idle');
+          }
+        })
+        .catch((err) => {
+          console.error('Draft autosave failed:', err);
+          setDraftSaveStatus('error');
+        });
+    }, 600);
+  }, []);
+
+  const handleRetrySaveDraft = () => {
+    const currentSeq = ++draftSaveSeqRef.current;
+    setDraftSaveStatus('saving');
+    saveActiveDraft(pendingDraftRef.current)
+      .then(() => {
+        if (currentSeq >= draftSaveSeqRef.current) {
+          setDraftSaveStatus('idle');
+        }
+      })
+      .catch(() => setDraftSaveStatus('error'));
+  };
+
+  const activeProfile =
+    profiles.find((p) => p.id === activeProfileId) || profiles[0] || null;
+
+  // Profile operations
   const handleUpdateProfile = useCallback((updated: HandwritingProfile) => {
     setProfiles((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
     saveProfile(updated).catch(console.error);
   }, []);
 
-  const handleCreateProfile = (name: string) => {
-    const newProf = createNewProfile(name);
-    // Seed standard starter characters for immediate typing convenience
-    newProf.glyphs = populateStarterAlphabet();
+  const handleCreatePersonalProfile = (name?: string) => {
+    const profileName = name && name.trim() ? name.trim() : 'My Handwriting';
+    // Personal profiles start completely empty
+    const newProf = createNewPersonalProfile(profileName);
     saveProfile(newProf).then(() => {
       setProfiles((prev) => [...prev, newProf]);
       setActiveProfileId(newProf.id);
+      triggerDraftSave({ ...draft, profileId: newProf.id });
     });
   };
 
   const handleRenameProfile = (id: string, newName: string) => {
     const target = profiles.find((p) => p.id === id);
-    if (!target) return;
+    if (!target || target.isDemo) return;
     const updated = { ...target, name: newName, updatedAt: Date.now() };
     handleUpdateProfile(updated);
   };
 
   const handleDeleteProfile = (id: string) => {
-    if (profiles.length <= 1) return;
     deleteProfile(id).then(() => {
       const remaining = profiles.filter((p) => p.id !== id);
       setProfiles(remaining);
-      setActiveProfileId(remaining[0].id);
+      const nextActiveId = remaining.length > 0 ? remaining[0].id : '';
+      setActiveProfileId(nextActiveId);
+      triggerDraftSave({ ...draft, profileId: nextActiveId });
     });
+  };
+
+  const handleSelectProfile = (id: string) => {
+    setActiveProfileId(id);
+    triggerDraftSave({ ...draft, profileId: id });
   };
 
   const handleExportProfile = () => {
@@ -104,13 +234,41 @@ export const HandwritingLab: React.FC = () => {
           return [...filtered, validated];
         });
         setActiveProfileId(validated.id);
+        triggerDraftSave({ ...draft, profileId: validated.id });
       });
     };
-    reader.onerror = () => setImportError('Failed to read file from disk.');
+    reader.onerror = () => setImportError('Failed to read profile file from disk.');
     reader.readAsText(file);
   };
 
-  if (!isLoaded || !activeProfile) {
+  // Recoverable error view if IndexedDB read fails
+  if (profileLoadError) {
+    return (
+      <div className="w-full h-full flex flex-col items-center justify-center bg-neutral-50 p-6 text-neutral-800 font-sans">
+        <div className="max-w-md w-full bg-white rounded-xl shadow-lg border border-neutral-200 p-6 space-y-4">
+          <div className="flex items-center gap-3 text-rose-600">
+            <AlertCircle className="w-6 h-6 shrink-0" />
+            <h2 className="text-base font-semibold">Handwriting Storage Failure</h2>
+          </div>
+          <p className="text-xs text-neutral-600 leading-relaxed">
+            InkForge could not open your local handwriting profiles. Your notebook data is safe in its separate database.
+          </p>
+          <div className="p-2.5 rounded bg-neutral-100 font-mono text-[11px] text-neutral-700 break-all">
+            {profileLoadError}
+          </div>
+          <button
+            onClick={loadLabData}
+            className="w-full py-2 px-4 rounded-lg bg-indigo-600 text-white font-medium text-xs flex items-center justify-center gap-2 hover:bg-indigo-700 transition-colors shadow-xs"
+          >
+            <RefreshCw className="w-4 h-4" />
+            <span>Retry Loading Handwriting Lab</span>
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isLoaded) {
     return (
       <div className="w-full h-full flex items-center justify-center bg-neutral-50 text-neutral-500 font-sans text-xs">
         Loading Handwriting Lab...
@@ -120,8 +278,8 @@ export const HandwritingLab: React.FC = () => {
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-neutral-100 text-neutral-900 font-sans">
-      {/* 1. Transparent Disclosure Notice Banner */}
-      <div className="bg-neutral-900 text-neutral-300 border-b border-neutral-800 px-4 py-2.5 flex items-start justify-between text-xs">
+      {/* 1. Transparent Disclosure Notice Banner & Tab Switcher */}
+      <div className="bg-neutral-900 text-neutral-300 border-b border-neutral-800 px-4 py-2.5 flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs">
         <div className="flex items-start gap-2.5">
           <Info className="w-4 h-4 text-indigo-400 mt-0.5 shrink-0" />
           <div className="space-y-0.5">
@@ -129,13 +287,13 @@ export const HandwritingLab: React.FC = () => {
               Sample-based handwriting — experimental
             </p>
             <p className="text-neutral-400 text-[11px] leading-relaxed">
-              This engine composes new words by assembling your captured character stroke vectors. It stores baseline, advance width, and spacing metadata rather than stretching glyphs. It does not perform neural cursive synthesis or learned ligature joining. All captured strokes are stored locally in your browser's IndexedDB and never uploaded to any server.
+              This engine composes new words by assembling your captured character stroke vectors. It stores baseline, advance width, and spacing metadata rather than stretching glyphs. It does not perform neural cursive synthesis or learned ligature joining. All captured strokes are stored locally in your browser&apos;s IndexedDB and never uploaded to any server.
             </p>
           </div>
         </div>
 
-        {/* Sub-tab navigation */}
-        <div className="flex items-center gap-1 shrink-0 ml-4">
+        {/* Workspace Sub-tabs */}
+        <div className="flex items-center gap-1 shrink-0 self-end md:self-center">
           <button
             onClick={() => setActiveLabTab('compose')}
             className={`flex items-center gap-1.5 px-3 py-1 rounded text-xs transition-colors ${
@@ -182,8 +340,8 @@ export const HandwritingLab: React.FC = () => {
       <ProfileManager
         profiles={profiles}
         activeProfile={activeProfile}
-        onSelectProfile={(id) => setActiveProfileId(id)}
-        onCreateProfile={handleCreateProfile}
+        onSelectProfile={handleSelectProfile}
+        onCreateProfile={handleCreatePersonalProfile}
         onRenameProfile={handleRenameProfile}
         onDeleteProfile={handleDeleteProfile}
         onExportProfile={handleExportProfile}
@@ -193,11 +351,18 @@ export const HandwritingLab: React.FC = () => {
       {/* 4. Active Workspace Content */}
       <div className="flex-1 flex overflow-hidden">
         {activeLabTab === 'compose' ? (
-          <DocumentComposer profile={activeProfile} />
+          <DocumentComposer
+            profile={activeProfile}
+            draft={draft}
+            onUpdateDraft={triggerDraftSave}
+            draftSaveStatus={draftSaveStatus}
+            onRetrySaveDraft={handleRetrySaveDraft}
+          />
         ) : (
           <CaptureStudio
             profile={activeProfile}
             onUpdateProfile={handleUpdateProfile}
+            onCreateNewPersonalProfile={() => handleCreatePersonalProfile()}
           />
         )}
       </div>

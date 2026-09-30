@@ -1,21 +1,41 @@
 import React, { useState } from 'react';
 import { HandwritingProfile, CharacterSample, SUPPORTED_CHARACTERS } from '../../handwriting/types';
+import { isStarterSample } from '../../handwriting/profileStorage';
 import { CaptureCell } from './CaptureCell';
-import { CheckCircle2, CircleDashed } from 'lucide-react';
+import { CheckCircle2, CircleDashed, Sparkles, User } from 'lucide-react';
 
 interface CaptureStudioProps {
-  profile: HandwritingProfile;
+  profile: HandwritingProfile | null;
   onUpdateProfile: (updated: HandwritingProfile) => void;
+  onCreateNewPersonalProfile: () => void;
 }
 
 export const CaptureStudio: React.FC<CaptureStudioProps> = ({
   profile,
   onUpdateProfile,
+  onCreateNewPersonalProfile,
 }) => {
   const [activeCategory, setActiveCategory] = useState<'lowercase' | 'uppercase' | 'digits' | 'punctuation'>('lowercase');
   const [selectedChar, setSelectedChar] = useState<string>('a');
 
-  // Total supported character count
+  if (!profile) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center bg-neutral-50 p-6 text-center text-neutral-600">
+        <User className="w-12 h-12 text-neutral-300 mb-3" />
+        <h3 className="text-sm font-semibold text-neutral-800">No Handwriting Profile</h3>
+        <p className="text-xs text-neutral-500 max-w-sm mt-1 leading-relaxed">
+          Create a personal profile to capture your handwriting samples, or switch to the Starter Demo profile.
+        </p>
+        <button
+          onClick={onCreateNewPersonalProfile}
+          className="mt-4 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium shadow-xs transition-colors"
+        >
+          Create Personal Profile
+        </button>
+      </div>
+    );
+  }
+
   const allCharacters = [
     ...SUPPORTED_CHARACTERS.lowercase,
     ...SUPPORTED_CHARACTERS.uppercase,
@@ -23,9 +43,14 @@ export const CaptureStudio: React.FC<CaptureStudioProps> = ({
     ...SUPPORTED_CHARACTERS.punctuation,
   ];
 
-  const capturedCount = allCharacters.filter(
-    (c) => profile.glyphs[c] && profile.glyphs[c].length > 0 && profile.glyphs[c][0].strokes.length > 0
-  ).length;
+  // Count strictly real user-captured samples for personal profiles
+  const capturedCount = allCharacters.filter((c) => {
+    const samples = profile.glyphs[c] || [];
+    if (profile.isDemo) {
+      return samples.length > 0 && samples[0].strokes.length > 0;
+    }
+    return samples.some((s) => !isStarterSample(s) && s.strokes.length > 0);
+  }).length;
 
   const currentCategoryChars = SUPPORTED_CHARACTERS[activeCategory];
 
@@ -41,7 +66,6 @@ export const CaptureStudio: React.FC<CaptureStudioProps> = ({
       updatedList = [...existingSamples, sample];
     }
 
-    // Filter out completely empty samples
     updatedList = updatedList.filter((s) => s.strokes && s.strokes.length > 0);
 
     const updatedProfile: HandwritingProfile = {
@@ -79,7 +103,20 @@ export const CaptureStudio: React.FC<CaptureStudioProps> = ({
         {/* Top Progress & Category Selector */}
         <div className="p-3 border-b border-neutral-200 bg-white space-y-2">
           <div className="flex items-center justify-between">
-            <span className="font-semibold text-neutral-900 text-sm">Character Library</span>
+            <div className="flex items-center gap-2">
+              <span className="font-semibold text-neutral-900 text-sm">Character Library</span>
+              {profile.isDemo ? (
+                <span className="text-[10px] bg-purple-50 text-purple-700 border border-purple-200 px-2 py-0.5 rounded-full font-medium flex items-center gap-1">
+                  <Sparkles className="w-3 h-3" />
+                  <span>Demo Template</span>
+                </span>
+              ) : (
+                <span className="text-[10px] bg-indigo-50 text-indigo-700 border border-indigo-200 px-2 py-0.5 rounded-full font-medium">
+                  Personal Profile
+                </span>
+              )}
+            </div>
+
             <span className="font-mono text-xs text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full font-medium">
               {capturedCount} / {allCharacters.length} captured ({Math.round((capturedCount / allCharacters.length) * 100)}%)
             </span>
@@ -153,7 +190,9 @@ export const CaptureStudio: React.FC<CaptureStudioProps> = ({
           <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 gap-2.5">
             {currentCategoryChars.map((char) => {
               const samples = profile.glyphs[char] || [];
-              const isCaptured = samples.length > 0 && samples[0].strokes.length > 0;
+              const isCaptured = profile.isDemo
+                ? samples.length > 0 && samples[0].strokes.length > 0
+                : samples.some((s) => !isStarterSample(s) && s.strokes.length > 0);
               const isSelected = selectedChar === char;
 
               return (
