@@ -17,7 +17,7 @@ import {
   UpdateTextNoteCommand,
 } from '../utils/historyManager';
 import { strokeIntersectsEraser, isStrokeInViewport } from '../utils/geometry';
-import { X, Move, GripVertical, ZoomIn, ZoomOut, RotateCcw } from 'lucide-react';
+import { X, Move, GripVertical, ZoomIn, ZoomOut } from 'lucide-react';
 
 interface CanvasProps {
   page: PageData;
@@ -100,7 +100,10 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
   const isPointerDownRef = useRef<boolean>(false);
   const isPanningRef = useRef<boolean>(false);
   const lastPanPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
-  const erasedStrokesThisGestureRef = useRef<{ stroke: StrokeData; index: number }[]>([]);
+
+  // Map of stroke positions relative to document at start of erase gesture
+  const initialStrokeIndexMapRef = useRef<Map<string, number>>(new Map());
+  const erasedStrokesThisGestureRef = useRef<{ stroke: StrokeData; originalIndex: number }[]>([]);
 
   // Text note drag / resize state
   const [draggingNoteId, setDraggingNoteId] = useState<string | null>(null);
@@ -118,8 +121,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
   });
 
   const textBeforeEditRef = useRef<Map<string, string>>(new Map());
-
-  // Animation frame request ID for active stroke rendering
   const rAFRef = useRef<number | null>(null);
 
   // Coordinate transformations
@@ -154,12 +155,12 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     }
   }, [newNoteFocusId, onClearNewNoteFocus]);
 
-  // Global Keyboard shortcuts for Undo/Redo (without hijacking native text editing)
+  // Global Keyboard shortcuts for Undo/Redo
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
-        return; // Allow native undo/redo inside text fields
+        return;
       }
 
       const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
@@ -188,12 +189,15 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
+    // High-DPI clear: clear full backing bitmap with identity transform
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
     const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
     const width = canvas.width / dpr;
     const height = canvas.height / dpr;
-
-    ctx.save();
-    ctx.scale(dpr, dpr);
 
     // Pristine paper background
     ctx.fillStyle = '#ffffff';
@@ -264,13 +268,12 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     // Render committed strokes
     for (const stroke of page.strokes) {
       if (stroke.bounds && !isStrokeInViewport(stroke.bounds, minWX, minWY, maxWX, maxWY)) {
-        continue; // Culled!
+        continue;
       }
 
       const pts = stroke.smoothedPoints || stroke.points;
       if (pts.length < 2) {
         if (pts.length === 1) {
-          // Pen tap dot
           const p = worldToScreen(pts[0].x, pts[0].y);
           ctx.fillStyle = stroke.color;
           ctx.beginPath();
@@ -317,28 +320,24 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
         }
       }
     }
-
-    ctx.restore();
   }, [page.strokes, page.gridSpacing, backgroundPattern, zoom, pan, screenToWorld, worldToScreen]);
 
-  // 2. Redraw Active Canvas (Only in-flight stroke, ultra fast)
+  // 2. Redraw Active Canvas (High-DPI safe clearing)
   const redrawActive = useCallback(() => {
     const canvas = activeCanvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const dpr = window.devicePixelRatio || 1;
-    const width = canvas.width / dpr;
-    const height = canvas.height / dpr;
-
-    ctx.clearRect(0, 0, width, height);
+    // Reset transform to identity and clear the entire physical backing bitmap
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     const activePoints = activePointsRef.current;
     if (activePoints.length === 0) return;
 
-    ctx.save();
-    ctx.scale(dpr, dpr);
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     const tool = activeGestureToolRef.current;
     const strokeWidth = tool === 'highlighter' ? highlighterWidth : baseWidth;
@@ -387,8 +386,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
         }
       }
     }
-
-    ctx.restore();
   }, [activeColor, baseWidth, highlighterWidth, zoom, worldToScreen]);
 
   // Setup ResizeObserver for container size
@@ -402,12 +399,12 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
         const dpr = window.devicePixelRatio || 1;
 
         if (baseCanvasRef.current) {
-          baseCanvasRef.current.width = width * dpr;
-          baseCanvasRef.current.height = height * dpr;
+          baseCanvasRef.current.width = Math.ceil(width * dpr);
+          baseCanvasRef.current.height = Math.ceil(height * dpr);
         }
         if (activeCanvasRef.current) {
-          activeCanvasRef.current.width = width * dpr;
-          activeCanvasRef.current.height = height * dpr;
+          activeCanvasRef.current.width = Math.ceil(width * dpr);
+          activeCanvasRef.current.height = Math.ceil(height * dpr);
         }
         redrawBase();
       }
@@ -422,10 +419,10 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     redrawBase();
   }, [redrawBase]);
 
-  // Segment Eraser execution
+  // Segment Eraser execution (preserving stroke positions relative to document at gesture start)
   const executeEraserAt = (worldX: number, worldY: number) => {
     const strokes = page.strokes;
-    const hitItems: { stroke: StrokeData; index: number }[] = [];
+    const hitItems: { stroke: StrokeData; originalIndex: number }[] = [];
 
     for (let i = 0; i < strokes.length; i++) {
       const s = strokes[i];
@@ -433,7 +430,9 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
         continue;
       }
       if (strokeIntersectsEraser(s, worldX, worldY, eraserRadius / zoom)) {
-        hitItems.push({ stroke: s, index: i });
+        // Record stroke index relative to document at gesture start
+        const originalIndex = initialStrokeIndexMapRef.current.get(s.id) ?? i;
+        hitItems.push({ stroke: s, originalIndex });
       }
     }
 
@@ -449,7 +448,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
 
   // Pointer event handlers
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    // Only capture single primary pointer for drawing
     if (activePointerIdRef.current !== null) return;
     activePointerIdRef.current = e.pointerId;
 
@@ -466,7 +464,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     const screenX = e.clientX - rect.left;
     const screenY = e.clientY - rect.top;
 
-    // Detect gesture tool at start of gesture
     let currentTool = activeTool;
     const isHardwareEraser =
       e.buttons === 32 ||
@@ -479,7 +476,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     }
     activeGestureToolRef.current = currentTool;
 
-    // Pan mode or middle mouse click
     if (currentTool === 'pan' || e.button === 1 || e.buttons === 4) {
       isPanningRef.current = true;
       lastPanPosRef.current = { x: screenX, y: screenY };
@@ -489,7 +485,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     const world = screenToWorld(screenX, screenY);
     const pressure = e.pressure > 0 ? e.pressure : 0.5;
 
-    // Type mode: click to place a text box
     if (currentTool === 'text') {
       const newNote: TextNoteContainer = {
         id: `note_${Date.now()}`,
@@ -504,15 +499,20 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
       return;
     }
 
-    // Eraser mode
     if (currentTool === 'eraser') {
       isPointerDownRef.current = true;
       erasedStrokesThisGestureRef.current = [];
+
+      // Record snapshot of all stroke positions relative to document at gesture start
+      const map = new Map<string, number>();
+      page.strokes.forEach((s, idx) => map.set(s.id, idx));
+      initialStrokeIndexMapRef.current = map;
+
       executeEraserAt(world.x, world.y);
       return;
     }
 
-    // Drawing (Pen or Highlighter)
+    // Drawing
     isPointerDownRef.current = true;
     activePointsRef.current = [
       {
@@ -546,7 +546,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
 
     if (!isPointerDownRef.current) return;
 
-    // Collect coalesced points if digitizer supports high frequency
     const nativeEvent = e.nativeEvent as PointerEvent;
     const coalescedEvents =
       typeof nativeEvent?.getCoalescedEvents === 'function'
@@ -564,7 +563,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
       return;
     }
 
-    // Add sampled points
     for (const cev of coalescedEvents) {
       const cx = cev.clientX - rect.left;
       const cy = cev.clientY - rect.top;
@@ -581,7 +579,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
       });
     }
 
-    // Request active canvas redraw in rAF
     if (rAFRef.current === null) {
       rAFRef.current = requestAnimationFrame(() => {
         redrawActive();
@@ -606,6 +603,7 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
         const cmd = new BatchEraseCommand(page.id, removed);
         historyManager.executeCommand(cmd, onUpdatePage);
       }
+      initialStrokeIndexMapRef.current.clear();
       isPointerDownRef.current = false;
       activePointerIdRef.current = null;
       return;
@@ -616,7 +614,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     if (points.length > 0) {
       const toolWidth = currentTool === 'highlighter' ? highlighterWidth : baseWidth;
 
-      // Handle pen tap dot
       if (points.length === 1) {
         const pt = points[0];
         const r = toolWidth * 0.75;
@@ -666,11 +663,12 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     isPointerDownRef.current = false;
     activePointerIdRef.current = null;
 
-    // Clear active canvas and let base canvas render the newly committed stroke
+    // High-DPI clear active canvas
     const canvas = activeCanvasRef.current;
     if (canvas) {
       const ctx = canvas.getContext('2d');
       if (ctx) {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.clearRect(0, 0, canvas.width, canvas.height);
       }
     }
@@ -757,7 +755,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     };
   };
 
-  // Global window listeners for drag & resize
   useEffect(() => {
     if (!draggingNoteId && !resizingNoteId) return;
 
@@ -829,7 +826,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     };
   }, [draggingNoteId, resizingNoteId, zoom, page.textNotes, page.id, historyManager, onUpdatePage]);
 
-  // Record text change history on blur
   const handleNoteFocus = (noteId: string, currentText: string) => {
     if (!textBeforeEditRef.current.has(noteId)) {
       textBeforeEditRef.current.set(noteId, currentText);
@@ -860,7 +856,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     historyManager.executeCommand(cmd, onUpdatePage);
   };
 
-  // Synchronized header position
   const headerScreenPos = worldToScreen(72, 32);
 
   const formattedDate = new Date(page.createdAt).toLocaleDateString(undefined, {
@@ -880,13 +875,13 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
       onWheel={handleWheel}
       className="flex-1 relative overflow-hidden bg-white select-none touch-none cursor-crosshair"
     >
-      {/* Layer 1: Base Canvas (Paper background, rules, committed strokes) */}
+      {/* Layer 1: Base Canvas */}
       <canvas
         ref={baseCanvasRef}
         className="absolute inset-0 w-full h-full block pointer-events-none"
       />
 
-      {/* Layer 2: Active Canvas (Pointer capture & active gesture stroke) */}
+      {/* Layer 2: Active Canvas (Pointer capture & in-flight stroke) */}
       <canvas
         ref={activeCanvasRef}
         onPointerDown={handlePointerDown}
@@ -925,11 +920,10 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
           <span>{formattedTime}</span>
         </div>
 
-        {/* Separator rule beneath header */}
         <div className="w-full h-px bg-neutral-300 mt-2" />
       </div>
 
-      {/* Text Containers (Fixed double-scaling, fully draggable & resizable) */}
+      {/* Text Containers (Document coordinate width, single scale transform) */}
       {(page.textNotes || []).map((note) => {
         const screenPos = worldToScreen(note.x, note.y);
         return (
@@ -939,13 +933,12 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
               position: 'absolute',
               left: `${screenPos.x}px`,
               top: `${screenPos.y}px`,
-              width: `${note.width}px`, // Fixed double-scaling bug: width is in world units, transformed by zoom
+              width: `${note.width}px`,
               transform: `scale(${zoom})`,
               transformOrigin: 'top left',
             }}
             className="group pointer-events-auto bg-white/95 backdrop-blur-xs border border-neutral-300 hover:border-indigo-400 focus-within:border-indigo-600 rounded shadow-xs hover:shadow-md transition-shadow z-20"
           >
-            {/* Draggable Header Handle */}
             <div
               onPointerDown={(e) => startNoteDrag(note.id, e)}
               className="h-5 bg-neutral-100 group-hover:bg-indigo-50/80 rounded-t flex items-center justify-between px-1.5 cursor-move select-none text-neutral-500"
@@ -967,7 +960,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
               </button>
             </div>
 
-            {/* Note Text Field */}
             <textarea
               id={`textarea_${note.id}`}
               value={note.text}
@@ -986,7 +978,6 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
               className="w-full bg-transparent text-xs text-neutral-900 focus:outline-none resize-none p-2 min-h-[70px] font-sans leading-relaxed"
             />
 
-            {/* Right Resize Handle */}
             <div
               onPointerDown={(e) => startNoteResize(note.id, e)}
               className="absolute right-0 top-5 bottom-0 w-2.5 cursor-ew-resize flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
@@ -998,7 +989,7 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
         );
       })}
 
-      {/* Discreet Bottom-Right Zoom Bar */}
+      {/* Zoom Control Bar */}
       <div className="absolute bottom-3 right-4 z-30 flex items-center gap-1.5 bg-white/90 backdrop-blur-md px-2.5 py-1 rounded-md border border-neutral-200 shadow-xs text-xs font-mono text-neutral-600">
         <button
           onClick={() => setZoom((z) => Math.max(0.3, z * 0.9))}

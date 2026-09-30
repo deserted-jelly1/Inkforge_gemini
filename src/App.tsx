@@ -30,7 +30,7 @@ import {
   createBackupEnvelope,
 } from './utils/storage';
 import { exportPageAsPNG, exportPageAsPDF } from './utils/exportPage';
-import { AlertCircle, X } from 'lucide-react';
+import { AlertCircle, X, RefreshCw } from 'lucide-react';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'draw' | 'home' | 'view' | 'dev'>('draw');
@@ -41,70 +41,89 @@ export default function App() {
   const [baseWidth, setBaseWidth] = useState<number>(2.2);
   const [highlighterWidth, setHighlighterWidth] = useState<number>(16.0);
   const [eraserRadius, setEraserRadius] = useState<number>(20);
-  const [backgroundPattern, setBackgroundPattern] = useState<BackgroundPattern>('lined');
 
   // Sidebar and History Drawer state
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(false);
   const [isHistoryOpen, setIsHistoryOpen] = useState<boolean>(false);
 
-  // Persistence Save Status
+  // Persistence and Error States
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   const [importError, setImportError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [isLoaded, setIsLoaded] = useState<boolean>(false);
 
-  // Page History Registry (maintains independent page-scoped undo/redo stacks)
+  // Monotonic save sequence tracking to guarantee older in-flight saves never mark newer pending edits as saved
+  const saveSequenceRef = useRef<number>(0);
+  const lastSavedSequenceRef = useRef<number>(0);
+
+  // Session key to force fresh canvas mount and transient state reset on document restore
+  const [sessionKey, setSessionKey] = useState<number>(0);
+
+  // Page History Registry
   const historyRegistryRef = useRef<PageHistoryRegistry>(new PageHistoryRegistry());
   const [, setHistoryRenderTick] = useState<number>(0);
 
   // Newly created note to focus
   const [newNoteFocusId, setNewNoteFocusId] = useState<string | null>(null);
 
-  // Notebook state
+  // Notebook state (initialized with empty dummy until load completes)
   const [notebook, setNotebook] = useState<NotebookData>(() => seedDefaultNotebook());
-  const [isLoaded, setIsLoaded] = useState<boolean>(false);
 
   // Debounced Autosave Timer Ref
   const autosaveTimeoutRef = useRef<any>(null);
   const pendingNotebookRef = useRef<NotebookData>(notebook);
 
-  // 1. Initial Load: Restore from IndexedDB or seed on first use
-  useEffect(() => {
-    let isMounted = true;
+  // 1. Initial Load: Explicitly separate 'found', 'not_found', and 'error'
+  const performInitialLoad = useCallback(() => {
+    setLoadError(null);
+    setIsLoaded(false);
+
     loadActiveNotebook()
-      .then((savedNotebook) => {
-        if (!isMounted) return;
-        if (savedNotebook) {
-          setNotebook(savedNotebook);
-          pendingNotebookRef.current = savedNotebook;
-          // Set background pattern from active page
-          const activeSec =
-            savedNotebook.sections.find((s) => s.id === savedNotebook.activeSectionId) ||
-            savedNotebook.sections[0];
-          const activeP =
-            activeSec.pages.find((p) => p.id === savedNotebook.activePageId) || activeSec.pages[0];
-          if (activeP.backgroundPattern) {
-            setBackgroundPattern(activeP.backgroundPattern);
-          }
-        } else {
+      .then((result) => {
+        if (result.status === 'found') {
+          setNotebook(result.notebook);
+          pendingNotebookRef.current = result.notebook;
+          setSaveStatus('idle');
+          setIsLoaded(true);
+        } else if (result.status === 'not_found') {
+          // No notebook exists yet: seed default notebook
           const seeded = seedDefaultNotebook();
           setNotebook(seeded);
           pendingNotebookRef.current = seeded;
-          saveActiveNotebook(seeded).catch(console.error);
+          const seq = ++saveSequenceRef.current;
+          saveActiveNotebook(seeded)
+            .then(() => {
+              if (seq >= lastSavedSequenceRef.current) {
+                lastSavedSequenceRef.current = seq;
+                setSaveStatus('idle');
+              }
+            })
+            .catch((err) => {
+              console.error('Failed saving seeded notebook:', err);
+              setSaveStatus('error');
+            });
+          setIsLoaded(true);
+        } else if (result.status === 'error') {
+          // Read error: NEVER seed or overwrite storage after a read error!
+          setLoadError(result.error);
+          setIsLoaded(true);
         }
-        setIsLoaded(true);
       })
       .catch((err) => {
-        console.error('Error loading notebook:', err);
+        setLoadError(err?.message || 'Failed initializing storage.');
         setIsLoaded(true);
       });
-
-    return () => {
-      isMounted = false;
-    };
   }, []);
 
-  // 2. Debounced Autosave to IndexedDB
+  useEffect(() => {
+    performInitialLoad();
+  }, [performInitialLoad]);
+
+  // 2. Debounced Autosave with Sequence Numbering
   const triggerAutosave = useCallback((updatedNotebook: NotebookData) => {
     pendingNotebookRef.current = updatedNotebook;
+    const currentSeq = ++saveSequenceRef.current;
     setSaveStatus('saving');
 
     if (autosaveTimeoutRef.current) {
@@ -114,7 +133,11 @@ export default function App() {
     autosaveTimeoutRef.current = setTimeout(() => {
       saveActiveNotebook(pendingNotebookRef.current)
         .then(() => {
-          setSaveStatus('idle');
+          // Only mark saved if no newer edits occurred while this save was executing
+          if (currentSeq >= saveSequenceRef.current) {
+            lastSavedSequenceRef.current = currentSeq;
+            setSaveStatus('idle');
+          }
         })
         .catch((err) => {
           console.error('Autosave failed:', err);
@@ -124,9 +147,15 @@ export default function App() {
   }, []);
 
   const handleRetrySave = () => {
+    const currentSeq = ++saveSequenceRef.current;
     setSaveStatus('saving');
     saveActiveNotebook(pendingNotebookRef.current)
-      .then(() => setSaveStatus('idle'))
+      .then(() => {
+        if (currentSeq >= saveSequenceRef.current) {
+          lastSavedSequenceRef.current = currentSeq;
+          setSaveStatus('idle');
+        }
+      })
       .catch(() => setSaveStatus('error'));
   };
 
@@ -135,6 +164,9 @@ export default function App() {
     notebook.sections.find((s) => s.id === notebook.activeSectionId) || notebook.sections[0];
   const activePage =
     activeSection.pages.find((p) => p.id === notebook.activePageId) || activeSection.pages[0];
+
+  // Derive paper pattern directly from active page instead of duplicating in global state
+  const backgroundPattern: BackgroundPattern = activePage.backgroundPattern || 'lined';
 
   // Subscribe to current page's history manager
   const currentHistoryManager = historyRegistryRef.current.getHistoryManager(activePage.id);
@@ -189,11 +221,6 @@ export default function App() {
       triggerAutosave(updated);
       return updated;
     });
-
-    // Sync background pattern of new page
-    if (sec.pages[0]?.backgroundPattern) {
-      setBackgroundPattern(sec.pages[0].backgroundPattern);
-    }
   };
 
   const handleSelectPage = (sectionId: string, pageId: string) => {
@@ -206,12 +233,6 @@ export default function App() {
       triggerAutosave(updated);
       return updated;
     });
-
-    const sec = notebook.sections.find((s) => s.id === sectionId);
-    const p = sec?.pages.find((page) => page.id === pageId);
-    if (p?.backgroundPattern) {
-      setBackgroundPattern(p.backgroundPattern);
-    }
   };
 
   const handleAddSection = () => {
@@ -305,7 +326,7 @@ export default function App() {
       title: 'Untitled page',
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      backgroundPattern,
+      backgroundPattern: 'lined',
       gridSpacing: 28,
       viewport: { zoom: 1.0, panX: 0, panY: 0 },
       strokes: [],
@@ -397,7 +418,6 @@ export default function App() {
     });
   };
 
-  // Clear Ink (preserving text and recoverable via undo)
   const handleClearInk = () => {
     if (activePage.strokes.length === 0) return;
     const prior = [...activePage.strokes];
@@ -405,7 +425,6 @@ export default function App() {
     currentHistoryManager.executeCommand(cmd, handleUpdateCurrentPage);
   };
 
-  // Insert Text Box Action
   const handleInsertTextBox = () => {
     const noteId = `note_${Date.now()}`;
     const newNote: TextNoteContainer = {
@@ -421,7 +440,6 @@ export default function App() {
     setActiveTool('text');
   };
 
-  // Export JSON Backup
   const handleExportJSON = () => {
     const envelope = createBackupEnvelope(notebook);
     const jsonBlob = new Blob([JSON.stringify(envelope, null, 2)], {
@@ -435,7 +453,7 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  // Restore JSON Backup
+  // 3. Restore: Clean document-session boundary
   const handleImportJSON = (file: File) => {
     setImportError(null);
     const reader = new FileReader();
@@ -443,36 +461,81 @@ export default function App() {
       const text = e.target?.result as string;
       const { notebook: validated, error } = validateAndParseBackup(text);
       if (error || !validated) {
+        // Preserve current notebook completely if validation fails
         setImportError(error || 'Failed to parse backup.');
         return;
       }
 
+      // Clean document-session boundary:
+      // 1. Cancel pending debounced autosaves
+      if (autosaveTimeoutRef.current) {
+        clearTimeout(autosaveTimeoutRef.current);
+        autosaveTimeoutRef.current = null;
+      }
+
+      // 2. Increment save sequence to drop any in-flight requests
+      const currentSeq = ++saveSequenceRef.current;
+
+      // 3. Reset all page histories and transient state
+      historyRegistryRef.current.resetAll();
+      setIsHistoryOpen(false);
+      setNewNoteFocusId(null);
+      setSessionKey((k) => k + 1);
+
+      // 4. Update notebook state
       setNotebook(validated);
       pendingNotebookRef.current = validated;
-      saveActiveNotebook(validated)
-        .then(() => setSaveStatus('idle'))
-        .catch(() => setSaveStatus('error'));
 
-      const sec =
-        validated.sections.find((s) => s.id === validated.activeSectionId) || validated.sections[0];
-      const p = sec.pages.find((page) => page.id === validated.activePageId) || sec.pages[0];
-      if (p.backgroundPattern) {
-        setBackgroundPattern(p.backgroundPattern);
-      }
+      // 5. Save imported document immediately
+      setSaveStatus('saving');
+      saveActiveNotebook(validated)
+        .then(() => {
+          if (currentSeq >= saveSequenceRef.current) {
+            lastSavedSequenceRef.current = currentSeq;
+            setSaveStatus('idle');
+          }
+        })
+        .catch(() => setSaveStatus('error'));
     };
-    reader.onerror = () => setImportError('Failed to read file.');
+    reader.onerror = () => setImportError('Failed to read file from disk.');
     reader.readAsText(file);
   };
 
   // Paper background change
   const handleChangePattern = (p: BackgroundPattern) => {
-    setBackgroundPattern(p);
     handleUpdateCurrentPage((prev) => ({
       ...prev,
       backgroundPattern: p,
       updatedAt: Date.now(),
     }));
   };
+
+  // Recoverable Load Error View
+  if (loadError) {
+    return (
+      <div className="w-screen h-screen flex flex-col items-center justify-center bg-neutral-50 p-6 text-neutral-800 font-sans">
+        <div className="max-w-md w-full bg-white rounded-xl shadow-lg border border-neutral-200 p-6 space-y-4">
+          <div className="flex items-center gap-3 text-rose-600">
+            <AlertCircle className="w-6 h-6 shrink-0" />
+            <h2 className="text-base font-semibold">Storage Read Failure</h2>
+          </div>
+          <p className="text-xs text-neutral-600 leading-relaxed">
+            InkForge encountered an error opening your local storage. To protect your notes, the app will not seed or overwrite existing data.
+          </p>
+          <div className="p-2.5 rounded bg-neutral-100 font-mono text-[11px] text-neutral-700 break-all">
+            {loadError}
+          </div>
+          <button
+            onClick={performInitialLoad}
+            className="w-full py-2 px-4 rounded-lg bg-indigo-600 text-white font-medium text-xs flex items-center justify-center gap-2 hover:bg-indigo-700 transition-colors shadow-xs"
+          >
+            <RefreshCw className="w-4 h-4" />
+            <span>Retry Loading Notebook</span>
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (!isLoaded) {
     return (
@@ -484,7 +547,7 @@ export default function App() {
 
   return (
     <div className="w-screen h-screen flex flex-col bg-[#f8fafc] text-neutral-900 overflow-hidden font-sans antialiased">
-      {/* Import Error Banner */}
+      {/* Import / Export Error Banners */}
       {importError && (
         <div className="bg-rose-50 border-b border-rose-200 px-4 py-2 flex items-center justify-between text-xs text-rose-800 z-50">
           <div className="flex items-center gap-2">
@@ -494,7 +557,23 @@ export default function App() {
           <button
             onClick={() => setImportError(null)}
             className="p-1 hover:bg-rose-100 rounded text-rose-600"
-            aria-label="Dismiss error"
+            aria-label="Dismiss import error"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      {exportError && (
+        <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 flex items-center justify-between text-xs text-amber-800 z-50">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span>{exportError}</span>
+          </div>
+          <button
+            onClick={() => setExportError(null)}
+            className="p-1 hover:bg-amber-100 rounded text-amber-600"
+            aria-label="Dismiss export error"
           >
             <X className="w-3.5 h-3.5" />
           </button>
@@ -524,8 +603,8 @@ export default function App() {
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         onInsertTextBox={handleInsertTextBox}
-        onExportPNG={() => exportPageAsPNG(activePage, notebook.title)}
-        onExportPDF={() => exportPageAsPDF(activePage, notebook.title)}
+        onExportPNG={() => exportPageAsPNG(activePage, notebook.title, setExportError)}
+        onExportPDF={() => exportPageAsPDF(activePage, notebook.title, setExportError)}
         onExportJSON={handleExportJSON}
         onImportJSON={handleImportJSON}
         saveStatus={saveStatus}
@@ -555,7 +634,7 @@ export default function App() {
         <div className="flex-1 flex overflow-hidden relative">
           {(activeTab === 'draw' || activeTab === 'home' || activeTab === 'view') && (
             <OneNoteCanvas
-              key={activePage.id}
+              key={`${activePage.id}_${sessionKey}`}
               page={activePage}
               onUpdatePage={handleUpdateCurrentPage}
               activeTool={activeTool}

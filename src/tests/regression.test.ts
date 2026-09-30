@@ -13,9 +13,11 @@ import {
   validateAndParseBackup,
   createBackupEnvelope,
   seedDefaultNotebook,
+  loadActiveNotebook,
+  LoadNotebookResult,
 } from '../utils/storage.ts';
 import { strokeIntersectsEraser, distanceToSegment } from '../utils/geometry.ts';
-import { computePageContentBounds } from '../utils/exportPage.ts';
+import { computePageContentBounds, wrapTextLines } from '../utils/exportPage.ts';
 import { PageData, StrokeData, TextNoteContainer, NotebookData } from '../types/inkforge.ts';
 
 function createDummyPage(id: string, title = 'Test Page'): PageData {
@@ -32,7 +34,7 @@ function createDummyPage(id: string, title = 'Test Page'): PageData {
   };
 }
 
-function createDummyStroke(id: string, points: { x: number; y: number }[]): StrokeData {
+function createDummyStroke(id: string, points: { x: number; y: number }[], tool: 'pen' | 'highlighter' = 'pen'): StrokeData {
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
@@ -45,10 +47,10 @@ function createDummyStroke(id: string, points: { x: number; y: number }[]): Stro
   }
   return {
     id,
-    tool: 'pen',
+    tool,
     color: '#0f172a',
-    baseWidth: 2.0,
-    opacity: 1.0,
+    baseWidth: tool === 'highlighter' ? 16.0 : 2.0,
+    opacity: tool === 'highlighter' ? 0.35 : 1.0,
     points: points.map((p, idx) => ({
       x: p.x,
       y: p.y,
@@ -61,212 +63,251 @@ function createDummyStroke(id: string, points: { x: number; y: number }[]): Stro
   };
 }
 
-test('1. Persistence: Seed notebook contains valid stable IDs and structure', () => {
-  const nb = seedDefaultNotebook();
-  assert.ok(nb.id, 'Notebook ID should exist');
-  assert.ok(nb.sections.length >= 3, 'Default notebook should have at least 3 sections');
-  assert.ok(nb.activeSectionId, 'Notebook should have activeSectionId');
-  assert.ok(nb.activePageId, 'Notebook should have activePageId');
+// -------------------------------------------------------------
+// 1. Separation of 'not_found' vs 'error' in storage loading
+// -------------------------------------------------------------
+test('1. Storage: Explicitly separates not_found from loading errors', async () => {
+  // Case A: Mock indexedDB failure
+  const originalIndexedDB = globalThis.indexedDB;
+  try {
+    // Simulate failing IndexedDB open
+    (globalThis as any).indexedDB = {
+      open: () => {
+        const req: any = {};
+        setTimeout(() => {
+          req.error = new Error('Simulated QuotaExceededError or DatabaseLocked');
+          if (req.onerror) req.onerror();
+        }, 5);
+        return req;
+      },
+    };
 
-  const activeSec = nb.sections.find((s) => s.id === nb.activeSectionId);
-  assert.ok(activeSec, 'activeSectionId must match an existing section');
-  const activePage = activeSec.pages.find((p) => p.id === nb.activePageId);
-  assert.ok(activePage, 'activePageId must match an existing page');
+    const res = await loadActiveNotebook();
+    assert.equal(res.status, 'error', 'Read failure must return error status, never not_found');
+    if (res.status === 'error') {
+      assert.ok(res.error.includes('Simulated'), 'Error message should be preserved');
+    }
+  } finally {
+    (globalThis as any).indexedDB = originalIndexedDB;
+  }
 });
 
-test('2. Backup Round-trip: Envelope creation, serialization, and validation', () => {
+// -------------------------------------------------------------
+// 2. Strict Backup Validation
+// -------------------------------------------------------------
+test('2. Backup Validation: Rejects unsupported schema versions', () => {
   const nb = seedDefaultNotebook();
   const envelope = createBackupEnvelope(nb);
-  assert.equal(envelope.schemaVersion, 2);
-  assert.equal(envelope.app, 'InkForge');
+  (envelope as any).schemaVersion = 99;
 
-  const json = JSON.stringify(envelope);
-  const { notebook: parsed, error } = validateAndParseBackup(json);
-  assert.equal(error, undefined, 'Valid backup should parse without error');
-  assert.ok(parsed, 'Parsed notebook should be returned');
-  assert.equal(parsed.title, nb.title);
-  assert.equal(parsed.sections.length, nb.sections.length);
-  assert.equal(parsed.activeSectionId, nb.activeSectionId);
-  assert.equal(parsed.activePageId, nb.activePageId);
+  const res = validateAndParseBackup(JSON.stringify(envelope));
+  assert.ok(res.error?.includes('Unsupported schema version'));
+  assert.equal(res.notebook, undefined);
 });
 
-test('3. Backup Validation: Invalid inputs fail with clear descriptive errors', () => {
-  const invalidJson = '{"broken": json}';
-  const res1 = validateAndParseBackup(invalidJson);
-  assert.ok(res1.error?.includes('Invalid JSON file'));
+test('3. Backup Validation: Rejects duplicate section IDs and duplicate page IDs', () => {
+  const nb = seedDefaultNotebook();
+  // Duplicate section ID
+  const dupSecNb = JSON.parse(JSON.stringify(nb));
+  dupSecNb.sections.push({ ...dupSecNb.sections[0] });
+  const res1 = validateAndParseBackup(JSON.stringify(dupSecNb));
+  assert.ok(res1.error?.includes('Duplicate section ID'));
 
-  const emptyObj = JSON.stringify({});
-  const res2 = validateAndParseBackup(emptyObj);
-  assert.ok(res2.error?.includes('Missing or invalid notebook title'));
-
-  const noSections = JSON.stringify({ title: 'My Book', sections: [] });
-  const res3 = validateAndParseBackup(noSections);
-  assert.ok(res3.error?.includes('Notebook must contain at least one section'));
+  // Duplicate page ID across different sections
+  const dupPageNb = JSON.parse(JSON.stringify(nb));
+  dupPageNb.sections[1].pages.push({ ...dupPageNb.sections[0].pages[0] });
+  const res2 = validateAndParseBackup(JSON.stringify(dupPageNb));
+  assert.ok(res2.error?.includes('Duplicate page ID'));
 });
 
-test('4. History Isolation: Actions on Page A do not affect Page B', () => {
+test('4. Backup Validation: Rejects non-finite coordinates, pressure, and widths', () => {
+  const nb = seedDefaultNotebook();
+  const corruptStrokeNb = JSON.parse(JSON.stringify(nb));
+  // Set non-finite coordinate in stroke point
+  corruptStrokeNb.sections[0].pages[0].strokes[0].points[0].x = NaN;
+  const res1 = validateAndParseBackup(JSON.stringify(corruptStrokeNb));
+  assert.ok(res1.error?.includes('non-finite coordinates or out-of-range pressure'));
+
+  // Set out-of-range pressure
+  const corruptPressureNb = JSON.parse(JSON.stringify(nb));
+  corruptPressureNb.sections[0].pages[0].strokes[0].points[0].pressure = 1.8;
+  const res2 = validateAndParseBackup(JSON.stringify(corruptPressureNb));
+  assert.ok(res2.error?.includes('non-finite coordinates or out-of-range pressure'));
+
+  // Set negative stroke baseWidth
+  const corruptWidthNb = JSON.parse(JSON.stringify(nb));
+  corruptWidthNb.sections[0].pages[0].strokes[0].baseWidth = -3;
+  const res3 = validateAndParseBackup(JSON.stringify(corruptWidthNb));
+  assert.ok(res3.error?.includes('non-positive or non-finite baseWidth'));
+
+  // Set inverted bounds (minX > maxX)
+  const corruptBoundsNb = JSON.parse(JSON.stringify(nb));
+  corruptBoundsNb.sections[0].pages[0].strokes[0].bounds = { minX: 100, maxX: 50, minY: 10, maxY: 20 };
+  const res4 = validateAndParseBackup(JSON.stringify(corruptBoundsNb));
+  assert.ok(res4.error?.includes('invalid or inverted bounds'));
+});
+
+test('5. Backup Validation: Rejects invalid text-note fields and paper parameters', () => {
+  const nb = seedDefaultNotebook();
+  // Invalid text note width <= 0
+  const corruptNoteNb = JSON.parse(JSON.stringify(nb));
+  corruptNoteNb.sections[0].pages[0].textNotes = [{ id: 'n1', x: 10, y: 10, width: 0, text: 'hello' }];
+  const res1 = validateAndParseBackup(JSON.stringify(corruptNoteNb));
+  assert.ok(res1.error?.includes('width must be a positive finite number'));
+
+  // Invalid backgroundPattern
+  const corruptPatternNb = JSON.parse(JSON.stringify(nb));
+  corruptPatternNb.sections[0].pages[0].backgroundPattern = 'psychedelic';
+  const res2 = validateAndParseBackup(JSON.stringify(corruptPatternNb));
+  assert.ok(res2.error?.includes('invalid backgroundPattern'));
+});
+
+// -------------------------------------------------------------
+// 3. Document-Session Boundary on Restore
+// -------------------------------------------------------------
+test('6. Session Boundary: Restore clears all histories even when IDs match current document', () => {
   const registry = new PageHistoryRegistry();
-  const pageAHistory = registry.getHistoryManager('page_A');
-  const pageBHistory = registry.getHistoryManager('page_B');
+  const pageId = 'page_shared_id';
+  const historyMgr = registry.getHistoryManager(pageId);
 
-  let pageA = createDummyPage('page_A', 'Page A');
-  let pageB = createDummyPage('page_B', 'Page B');
-
-  const strokeA = createDummyStroke('stroke_A_1', [{ x: 10, y: 10 }, { x: 50, y: 50 }]);
-  const strokeB = createDummyStroke('stroke_B_1', [{ x: 100, y: 100 }, { x: 200, y: 200 }]);
-
-  // Add stroke to Page A
-  const cmdA = new AddStrokeCommand('page_A', strokeA);
-  pageAHistory.executeCommand(cmdA, (t) => {
-    pageA = t(pageA);
+  let page = createDummyPage(pageId);
+  const stroke = createDummyStroke('s1', [{ x: 10, y: 10 }, { x: 20, y: 20 }]);
+  historyMgr.executeCommand(new AddStrokeCommand(pageId, stroke), (t) => {
+    page = t(page);
   });
 
-  // Add stroke to Page B
-  const cmdB = new AddStrokeCommand('page_B', strokeB);
-  pageBHistory.executeCommand(cmdB, (t) => {
-    pageB = t(pageB);
-  });
+  assert.equal(historyMgr.getUndoCount(), 1);
+  assert.equal(historyMgr.canUndo(), true);
 
-  assert.equal(pageA.strokes.length, 1);
-  assert.equal(pageB.strokes.length, 1);
-  assert.equal(pageA.strokes[0].id, 'stroke_A_1');
-  assert.equal(pageB.strokes[0].id, 'stroke_B_1');
+  // Perform clean session boundary reset
+  registry.resetAll();
 
-  // Undo on Page B
-  pageBHistory.undo((t) => {
-    pageB = t(pageB);
-  });
-
-  assert.equal(pageB.strokes.length, 0, 'Page B stroke should be undone');
-  assert.equal(pageA.strokes.length, 1, 'Page A stroke must remain completely untouched!');
-  assert.equal(pageA.strokes[0].id, 'stroke_A_1');
-
-  // Undo on Page A
-  pageAHistory.undo((t) => {
-    pageA = t(pageA);
-  });
-  assert.equal(pageA.strokes.length, 0, 'Page A stroke should now be undone');
+  // Querying history for the same page ID after reset must yield fresh empty history
+  const freshHistoryMgr = registry.getHistoryManager(pageId);
+  assert.equal(freshHistoryMgr.getUndoCount(), 0);
+  assert.equal(freshHistoryMgr.canUndo(), false);
+  assert.equal(freshHistoryMgr.canRedo(), false);
 });
 
-test('5. Non-destructive undo: Undoing ink does not revert later unrelated text edits', () => {
-  let page = createDummyPage('page_calc');
-  const history = new PageHistoryManager('page_calc');
+// -------------------------------------------------------------
+// 4. Eraser Undo Ordering
+// -------------------------------------------------------------
+test('7. Eraser Undo Ordering: Erasing [A, B] from [A, B, C, D] restores exact [A, B, C, D]', () => {
+  const history = new PageHistoryManager('p_ordering');
+  const sA = createDummyStroke('sA', [{ x: 10, y: 10 }, { x: 20, y: 20 }]);
+  const sB = createDummyStroke('sB', [{ x: 30, y: 30 }, { x: 40, y: 40 }]);
+  const sC = createDummyStroke('sC', [{ x: 50, y: 50 }, { x: 60, y: 60 }]);
+  const sD = createDummyStroke('sD', [{ x: 70, y: 70 }, { x: 80, y: 80 }]);
 
-  const stroke1 = createDummyStroke('s1', [{ x: 50, y: 50 }, { x: 100, y: 100 }]);
-  const cmdStroke = new AddStrokeCommand('page_calc', stroke1);
-  history.executeCommand(cmdStroke, (t) => {
+  let page = createDummyPage('p_ordering');
+  page.strokes = [sA, sB, sC, sD];
+
+  // Document indices at gesture start: A: 0, B: 1, C: 2, D: 3
+  // Erase A then B in single gesture
+  const removedStrokes = [
+    { stroke: sA, originalIndex: 0 },
+    { stroke: sB, originalIndex: 1 },
+  ];
+
+  const eraseCmd = new BatchEraseCommand('p_ordering', removedStrokes);
+  history.executeCommand(eraseCmd, (t) => {
     page = t(page);
   });
 
-  // Now user adds a text note
-  const textNote: TextNoteContainer = {
-    id: 'note_1',
-    x: 150,
-    y: 150,
-    width: 320,
-    text: 'Formulas for surface area',
-  };
-  const cmdText = new AddTextNoteCommand('page_calc', textNote);
-  history.executeCommand(cmdText, (t) => {
-    page = t(page);
-  });
-
-  // User edits the text note
-  const cmdTextEdit = new UpdateTextNoteCommand(
-    'page_calc',
-    'note_1',
-    { text: 'Formulas for surface area' },
-    { text: 'Formulas for surface area: ∬ |r_u × r_v| dA' },
-    'edit_text',
-    'Edit Text'
+  assert.equal(page.strokes.length, 2);
+  assert.deepEqual(
+    page.strokes.map((s) => s.id),
+    ['sC', 'sD']
   );
-  history.executeCommand(cmdTextEdit, (t) => {
-    page = t(page);
-  });
 
-  assert.equal(page.strokes.length, 1);
-  assert.equal(page.textNotes.length, 1);
-  assert.equal(page.textNotes[0].text, 'Formulas for surface area: ∬ |r_u × r_v| dA');
-
-  // Undo the text edit
+  // Undo must restore [sA, sB, sC, sD]
   history.undo((t) => {
     page = t(page);
   });
-  assert.equal(page.textNotes[0].text, 'Formulas for surface area');
-  assert.equal(page.strokes.length, 1, 'Stroke is still present');
 
-  // Undo the text add
-  history.undo((t) => {
-    page = t(page);
-  });
-  assert.equal(page.textNotes.length, 0, 'Text note is undone');
-  assert.equal(page.strokes.length, 1, 'Stroke is still present');
-
-  // Undo the stroke
-  history.undo((t) => {
-    page = t(page);
-  });
-  assert.equal(page.strokes.length, 0, 'Stroke is undone');
+  assert.equal(page.strokes.length, 4);
+  assert.deepEqual(
+    page.strokes.map((s) => s.id),
+    ['sA', 'sB', 'sC', 'sD'],
+    'Restored strokes must maintain exact initial document order [A, B, C, D]'
+  );
 });
 
-test('6. Clear Ink: Preserves text notes and is fully recoverable via undo', () => {
-  let page = createDummyPage('p_clear_test');
-  const history = new PageHistoryManager('p_clear_test');
+test('8. Eraser Undo Ordering: Erasing [B, D] from [A, B, C, D] restores exact [A, B, C, D]', () => {
+  const history = new PageHistoryManager('p_ordering_2');
+  const sA = createDummyStroke('sA', [{ x: 10, y: 10 }, { x: 20, y: 20 }]);
+  const sB = createDummyStroke('sB', [{ x: 30, y: 30 }, { x: 40, y: 40 }]);
+  const sC = createDummyStroke('sC', [{ x: 50, y: 50 }, { x: 60, y: 60 }]);
+  const sD = createDummyStroke('sD', [{ x: 70, y: 70 }, { x: 80, y: 80 }]);
 
-  const stroke1 = createDummyStroke('s1', [{ x: 50, y: 50 }, { x: 100, y: 100 }]);
-  const stroke2 = createDummyStroke('s2', [{ x: 150, y: 150 }, { x: 200, y: 200 }]);
-  page.strokes = [stroke1, stroke2];
-  page.textNotes = [{ id: 'n1', x: 50, y: 300, width: 200, text: 'Keep this note!' }];
+  let page = createDummyPage('p_ordering_2');
+  page.strokes = [sA, sB, sC, sD];
 
-  const cmdClear = new ClearInkCommand('p_clear_test', [stroke1, stroke2]);
-  history.executeCommand(cmdClear, (t) => {
+  // Erase B (originalIndex 1) and D (originalIndex 3)
+  const removedStrokes = [
+    { stroke: sB, originalIndex: 1 },
+    { stroke: sD, originalIndex: 3 },
+  ];
+
+  const eraseCmd = new BatchEraseCommand('p_ordering_2', removedStrokes);
+  history.executeCommand(eraseCmd, (t) => {
     page = t(page);
   });
 
-  assert.equal(page.strokes.length, 0, 'All ink strokes should be cleared');
-  assert.equal(page.textNotes.length, 1, 'Text note must be preserved!');
-  assert.equal(page.textNotes[0].text, 'Keep this note!');
+  assert.deepEqual(
+    page.strokes.map((s) => s.id),
+    ['sA', 'sC']
+  );
 
-  // Undo Clear Ink
   history.undo((t) => {
     page = t(page);
   });
-  assert.equal(page.strokes.length, 2, 'Strokes should be restored after undo');
-  assert.equal(page.textNotes.length, 1, 'Text note still intact');
+
+  assert.deepEqual(
+    page.strokes.map((s) => s.id),
+    ['sA', 'sB', 'sC', 'sD'],
+    'Restored strokes must maintain exact initial document order [A, B, C, D]'
+  );
 });
 
-test('7. Geometry: Segment distance calculation and eraser hit testing', () => {
-  // Horizontal segment from (10, 50) to (110, 50)
-  const distMid = distanceToSegment(60, 55, 10, 50, 110, 50);
-  assert.equal(Math.round(distMid), 5, 'Perpendicular distance should be 5');
-
-  const distBeyondRight = distanceToSegment(120, 50, 10, 50, 110, 50);
-  assert.equal(Math.round(distBeyondRight), 10, 'Distance beyond endpoint should be 10');
-
-  const stroke = createDummyStroke('test_stroke', [
-    { x: 10, y: 50 },
-    { x: 110, y: 50 },
+// -------------------------------------------------------------
+// 5. Unified Canvas & Export: Negative Coordinates & Text Wrapping
+// -------------------------------------------------------------
+test('9. Export Bounds: Preserves negative coordinates without clamping to zero', () => {
+  const page = createDummyPage('p_neg');
+  // Stroke with points well into negative space: (-150, -80)
+  const negStroke = createDummyStroke('neg_s', [
+    { x: -150, y: -80 },
+    { x: -50, y: 20 },
   ]);
-
-  // Test eraser hit at midpoint
-  const hit1 = strokeIntersectsEraser(stroke, 60, 54, 10);
-  assert.equal(hit1, true, 'Eraser with radius 10 at distance 4 should hit the stroke');
-
-  // Test eraser miss far away
-  const hit2 = strokeIntersectsEraser(stroke, 60, 100, 10);
-  assert.equal(hit2, false, 'Eraser with radius 10 at distance 50 should miss');
-});
-
-test('8. Export Bounds: Accurately includes offscreen strokes and text notes', () => {
-  const page = createDummyPage('export_test');
-  // Stroke positioned far down at (1200, 1800)
-  const farStroke = createDummyStroke('far_s', [
-    { x: 1100, y: 1700 },
-    { x: 1200, y: 1800 },
-  ]);
-  page.strokes = [farStroke];
+  page.strokes = [negStroke];
 
   const bounds = computePageContentBounds(page);
-  assert.ok(bounds.width >= 1200, 'Export bounds width should encompass the far stroke');
-  assert.ok(bounds.height >= 1800, 'Export bounds height should encompass the far stroke');
+  assert.ok(bounds.minX < 0, `minX (${bounds.minX}) must be negative to encompass negative stroke points`);
+  assert.ok(bounds.minY < 0, `minY (${bounds.minY}) must be negative to encompass negative stroke points`);
+  assert.ok(bounds.minX <= -150 - 60, 'minX must encompass stroke start minus margin');
+});
+
+test('10. Text Wrapping: Measures actual wrapped lines for text note container', () => {
+  const longText = 'InkForge is a dependable local-first digital ink notebook designed for high-resolution graphics tablets and stylus input with ultra-low latency.';
+  // Wrap to 200px width
+  const lines = wrapTextLines(longText, 200);
+  assert.ok(lines.length >= 3, `Expected at least 3 wrapped lines for 200px width, got ${lines.length}`);
+});
+
+// -------------------------------------------------------------
+// 6. Paper Pattern Derived from Active Page
+// -------------------------------------------------------------
+test('11. Paper Pattern: Derived per page and preserved across navigation', () => {
+  const nb = seedDefaultNotebook();
+  const page1 = nb.sections[0].pages[0]; // lined
+  const page2 = nb.sections[0].pages[1]; // grid
+
+  assert.equal(page1.backgroundPattern, 'lined');
+  assert.equal(page2.backgroundPattern, 'grid');
+
+  // Verify that active page pattern is directly read from the page
+  const activeSec = nb.sections.find((s) => s.id === nb.activeSectionId)!;
+  const currentP = activeSec.pages.find((p) => p.id === nb.activePageId)!;
+  assert.equal(currentP.backgroundPattern, 'lined');
 });

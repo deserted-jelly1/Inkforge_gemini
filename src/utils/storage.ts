@@ -1,4 +1,4 @@
-import { NotebookData, SectionData, PageData, StrokeData, BackupEnvelope } from '../types/inkforge';
+import { NotebookData, SectionData, PageData, StrokeData, BackupEnvelope, ToolType, BackgroundPattern } from '../types/inkforge';
 import { evaluateCentripetalCatmullRom } from './spline';
 
 const DB_NAME = 'inkforge_db';
@@ -6,6 +6,11 @@ const DB_VERSION = 1;
 const NOTEBOOK_STORE = 'notebooks';
 const METADATA_STORE = 'metadata';
 const CURRENT_NOTEBOOK_KEY = 'active_notebook_id';
+
+export type LoadNotebookResult =
+  | { status: 'found'; notebook: NotebookData }
+  | { status: 'not_found' }
+  | { status: 'error'; error: string };
 
 function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -26,75 +31,109 @@ function openDatabase(): Promise<IDBDatabase> {
     };
 
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onerror = () => reject(request.error || new Error('Failed to open IndexedDB'));
   });
 }
 
-export async function loadActiveNotebook(): Promise<NotebookData | null> {
+/**
+ * Loads the active notebook from IndexedDB.
+ * Explicitly separates 'not_found' from 'error' so callers never seed or overwrite on read failure.
+ */
+export async function loadActiveNotebook(): Promise<LoadNotebookResult> {
   try {
     const db = await openDatabase();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction([METADATA_STORE, NOTEBOOK_STORE], 'readonly');
-      const metaStore = tx.objectStore(METADATA_STORE);
-      const getMetaReq = metaStore.get(CURRENT_NOTEBOOK_KEY);
+    return new Promise((resolve) => {
+      try {
+        const tx = db.transaction([METADATA_STORE, NOTEBOOK_STORE], 'readonly');
+        const metaStore = tx.objectStore(METADATA_STORE);
+        const getMetaReq = metaStore.get(CURRENT_NOTEBOOK_KEY);
 
-      getMetaReq.onsuccess = () => {
-        const activeId = getMetaReq.result as string | undefined;
-        const nbStore = tx.objectStore(NOTEBOOK_STORE);
+        getMetaReq.onsuccess = () => {
+          const activeId = getMetaReq.result as string | undefined;
+          const nbStore = tx.objectStore(NOTEBOOK_STORE);
 
-        if (activeId) {
-          const getNbReq = nbStore.get(activeId);
-          getNbReq.onsuccess = () => {
-            if (getNbReq.result) {
-              resolve(getNbReq.result as NotebookData);
-            } else {
-              // Try getting first available notebook if active was not found
-              const getAllReq = nbStore.getAll();
-              getAllReq.onsuccess = () => {
-                const all = getAllReq.result as NotebookData[];
-                resolve(all.length > 0 ? all[0] : null);
-              };
-              getAllReq.onerror = () => resolve(null);
-            }
-          };
-          getNbReq.onerror = () => resolve(null);
-        } else {
-          const getAllReq = nbStore.getAll();
-          getAllReq.onsuccess = () => {
-            const all = getAllReq.result as NotebookData[];
-            resolve(all.length > 0 ? all[0] : null);
-          };
-          getAllReq.onerror = () => resolve(null);
-        }
-      };
+          if (activeId) {
+            const getNbReq = nbStore.get(activeId);
+            getNbReq.onsuccess = () => {
+              if (getNbReq.result) {
+                resolve({ status: 'found', notebook: getNbReq.result as NotebookData });
+              } else {
+                // Check if any other notebook exists
+                const getAllReq = nbStore.getAll();
+                getAllReq.onsuccess = () => {
+                  const all = getAllReq.result as NotebookData[];
+                  if (all.length > 0) {
+                    resolve({ status: 'found', notebook: all[0] });
+                  } else {
+                    resolve({ status: 'not_found' });
+                  }
+                };
+                getAllReq.onerror = () => {
+                  resolve({ status: 'error', error: getAllReq.error?.message || 'Failed reading notebooks' });
+                };
+              }
+            };
+            getNbReq.onerror = () => {
+              resolve({ status: 'error', error: getNbReq.error?.message || 'Failed reading active notebook' });
+            };
+          } else {
+            const getAllReq = nbStore.getAll();
+            getAllReq.onsuccess = () => {
+              const all = getAllReq.result as NotebookData[];
+              if (all.length > 0) {
+                resolve({ status: 'found', notebook: all[0] });
+              } else {
+                resolve({ status: 'not_found' });
+              }
+            };
+            getAllReq.onerror = () => {
+              resolve({ status: 'error', error: getAllReq.error?.message || 'Failed reading notebooks' });
+            };
+          }
+        };
 
-      getMetaReq.onerror = () => reject(getMetaReq.error);
+        getMetaReq.onerror = () => {
+          resolve({ status: 'error', error: getMetaReq.error?.message || 'Failed reading metadata store' });
+        };
+
+        tx.onerror = () => {
+          resolve({ status: 'error', error: tx.error?.message || 'Transaction error while loading notebook' });
+        };
+      } catch (txErr: any) {
+        resolve({ status: 'error', error: txErr?.message || 'Failed creating read transaction' });
+      }
     });
-  } catch (err) {
-    console.error('Failed to load from IndexedDB:', err);
-    return null;
+  } catch (err: any) {
+    return { status: 'error', error: err?.message || 'Failed to initialize IndexedDB' };
   }
 }
 
+/**
+ * Saves active notebook into IndexedDB with transactional guarantee.
+ */
 export async function saveActiveNotebook(notebook: NotebookData): Promise<void> {
   const db = await openDatabase();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction([NOTEBOOK_STORE, METADATA_STORE], 'readwrite');
-    const nbStore = tx.objectStore(NOTEBOOK_STORE);
-    const metaStore = tx.objectStore(METADATA_STORE);
+    try {
+      const tx = db.transaction([NOTEBOOK_STORE, METADATA_STORE], 'readwrite');
+      const nbStore = tx.objectStore(NOTEBOOK_STORE);
+      const metaStore = tx.objectStore(METADATA_STORE);
 
-    nbStore.put(notebook);
-    metaStore.put(notebook.id, CURRENT_NOTEBOOK_KEY);
+      nbStore.put(notebook);
+      metaStore.put(notebook.id, CURRENT_NOTEBOOK_KEY);
 
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(new Error('Transaction aborted'));
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error('Transaction failed'));
+      tx.onabort = () => reject(new Error('Transaction aborted'));
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 
 /**
  * Creates rich starter notebook for first-time use.
- * Never called if an existing notebook is found in IndexedDB.
+ * Only called when loadActiveNotebook returns status === 'not_found'.
  */
 export function seedDefaultNotebook(): NotebookData {
   const stroke1Pts = [
@@ -186,14 +225,14 @@ export function seedDefaultNotebook(): NotebookData {
   const mathSection: SectionData = {
     id: secMathId,
     title: 'Mathematics',
-    color: '#0284c7', // Sky Blue
+    color: '#0284c7',
     pages: [page1, page2],
   };
 
   const quickNotesSection: SectionData = {
     id: secQuickId,
     title: 'Quick Notes',
-    color: '#7c3aed', // Purple
+    color: '#7c3aed',
     pages: [
       {
         id: page3Id,
@@ -220,7 +259,7 @@ export function seedDefaultNotebook(): NotebookData {
   const researchSection: SectionData = {
     id: secResearchId,
     title: 'Research',
-    color: '#059669', // Emerald
+    color: '#059669',
     pages: [
       {
         id: page4Id,
@@ -256,119 +295,243 @@ export function seedDefaultNotebook(): NotebookData {
   };
 }
 
+const VALID_TOOLS: Set<ToolType> = new Set(['pen', 'highlighter', 'eraser', 'pan', 'text']);
+const VALID_PATTERNS: Set<BackgroundPattern> = new Set(['lined', 'grid', 'dotgrid', 'blank']);
+
 /**
- * Validates and parses a JSON backup file.
- * Returns either validated NotebookData or an error message.
+ * Rigorously validates and parses backup JSON without mutating existing state.
+ * Validates schema version, unique IDs, finite coordinates, pressure, widths,
+ * bounds, viewport values, paper spacing, and text-note fields.
  */
 export function validateAndParseBackup(jsonString: string): { notebook?: NotebookData; error?: string } {
   let parsed: any;
   try {
     parsed = JSON.parse(jsonString);
   } catch (err: any) {
-    return { error: `Invalid JSON file: ${err.message}` };
+    return { error: `Invalid JSON syntax: ${err.message}` };
   }
 
   if (!parsed || typeof parsed !== 'object') {
-    return { error: 'Backup file root is not an object.' };
+    return { error: 'Backup root must be an object.' };
   }
 
-  let rawNotebook = parsed;
-  // Handle envelope wrapper
-  if (parsed.schemaVersion && parsed.notebook) {
-    rawNotebook = parsed.notebook;
+  // Check schema version if envelope
+  if ('schemaVersion' in parsed) {
+    if (parsed.schemaVersion !== 2) {
+      return { error: `Unsupported schema version "${parsed.schemaVersion}". Supported version is 2.` };
+    }
+    if (parsed.app !== 'InkForge') {
+      return { error: `Invalid backup application signature "${parsed.app}". Expected "InkForge".` };
+    }
+  }
+
+  const rawNotebook = parsed.notebook ? parsed.notebook : parsed;
+
+  if (!rawNotebook || typeof rawNotebook !== 'object') {
+    return { error: 'Missing notebook payload in backup file.' };
+  }
+
+  if (typeof rawNotebook.id !== 'string' || !rawNotebook.id.trim()) {
+    return { error: 'Notebook missing valid string "id".' };
   }
 
   if (typeof rawNotebook.title !== 'string' || !rawNotebook.title.trim()) {
-    return { error: 'Missing or invalid notebook title.' };
+    return { error: 'Notebook missing or empty "title".' };
   }
 
   if (!Array.isArray(rawNotebook.sections) || rawNotebook.sections.length === 0) {
-    return { error: 'Notebook must contain at least one section.' };
+    return { error: 'Notebook must contain a non-empty "sections" array.' };
   }
 
-  // Validate each section
+  const sectionIdSet = new Set<string>();
+  const pageIdSet = new Set<string>();
+
   for (let sIdx = 0; sIdx < rawNotebook.sections.length; sIdx++) {
     const sec = rawNotebook.sections[sIdx];
     if (!sec || typeof sec !== 'object') {
-      return { error: `Section at index ${sIdx} is invalid.` };
+      return { error: `Section at index ${sIdx} is not a valid object.` };
     }
-    if (!sec.id || typeof sec.id !== 'string') {
-      sec.id = `sec_${Date.now()}_${sIdx}`;
+    if (typeof sec.id !== 'string' || !sec.id.trim()) {
+      return { error: `Section at index ${sIdx} has invalid or missing "id".` };
     }
-    if (typeof sec.title !== 'string') {
-      sec.title = `Section ${sIdx + 1}`;
+    if (sectionIdSet.has(sec.id)) {
+      return { error: `Duplicate section ID detected: "${sec.id}".` };
     }
-    if (typeof sec.color !== 'string') {
-      sec.color = '#4f46e5';
+    sectionIdSet.add(sec.id);
+
+    if (typeof sec.title !== 'string' || !sec.title.trim()) {
+      return { error: `Section "${sec.id}" has invalid or missing "title".` };
     }
+
     if (!Array.isArray(sec.pages) || sec.pages.length === 0) {
-      // Add empty page if none exists
-      sec.pages = [
-        {
-          id: `page_${Date.now()}_${sIdx}`,
-          title: 'Untitled page',
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          backgroundPattern: 'lined',
-          gridSpacing: 28,
-          strokes: [],
-          textNotes: [],
-        },
-      ];
+      return { error: `Section "${sec.title}" must contain at least one page.` };
     }
 
     for (let pIdx = 0; pIdx < sec.pages.length; pIdx++) {
       const page = sec.pages[pIdx];
       if (!page || typeof page !== 'object') {
-        return { error: `Page at index ${pIdx} in section "${sec.title}" is invalid.` };
+        return { error: `Page at index ${pIdx} in section "${sec.title}" is not an object.` };
       }
-      if (!page.id || typeof page.id !== 'string') {
-        page.id = `page_${Date.now()}_${sIdx}_${pIdx}`;
+      if (typeof page.id !== 'string' || !page.id.trim()) {
+        return { error: `Page at index ${pIdx} in section "${sec.title}" has invalid "id".` };
       }
+      if (pageIdSet.has(page.id)) {
+        return { error: `Duplicate page ID detected across notebook: "${page.id}".` };
+      }
+      pageIdSet.add(page.id);
+
       if (typeof page.title !== 'string') {
-        page.title = 'Untitled page';
+        return { error: `Page "${page.id}" title must be a string.` };
       }
+
+      // Pattern & Grid Spacing
+      if (page.backgroundPattern && !VALID_PATTERNS.has(page.backgroundPattern)) {
+        return { error: `Page "${page.title}" has invalid backgroundPattern: "${page.backgroundPattern}".` };
+      }
+      if (typeof page.gridSpacing !== 'undefined') {
+        if (!Number.isFinite(page.gridSpacing) || page.gridSpacing <= 0) {
+          return { error: `Page "${page.title}" has non-positive or non-finite gridSpacing: ${page.gridSpacing}.` };
+        }
+      }
+
+      // Viewport validation
+      if (page.viewport) {
+        if (
+          typeof page.viewport !== 'object' ||
+          !Number.isFinite(page.viewport.zoom) ||
+          page.viewport.zoom <= 0 ||
+          !Number.isFinite(page.viewport.panX) ||
+          !Number.isFinite(page.viewport.panY)
+        ) {
+          return { error: `Page "${page.title}" has invalid viewport parameters.` };
+        }
+      }
+
+      // Validate Strokes
       if (!Array.isArray(page.strokes)) {
-        page.strokes = [];
+        return { error: `Page "${page.title}" strokes must be an array.` };
       }
-      if (!Array.isArray(page.textNotes)) {
-        page.textNotes = [];
+
+      const strokeIdSet = new Set<string>();
+      for (let strIdx = 0; strIdx < page.strokes.length; strIdx++) {
+        const str = page.strokes[strIdx];
+        if (!str || typeof str !== 'object') {
+          return { error: `Stroke #${strIdx} on page "${page.title}" is not an object.` };
+        }
+        if (typeof str.id !== 'string' || !str.id.trim()) {
+          return { error: `Stroke #${strIdx} on page "${page.title}" missing valid string "id".` };
+        }
+        if (strokeIdSet.has(str.id)) {
+          return { error: `Duplicate stroke ID "${str.id}" on page "${page.title}".` };
+        }
+        strokeIdSet.add(str.id);
+
+        if (!VALID_TOOLS.has(str.tool)) {
+          return { error: `Stroke "${str.id}" has invalid tool: "${str.tool}".` };
+        }
+        if (typeof str.color !== 'string' || !str.color.trim()) {
+          return { error: `Stroke "${str.id}" has invalid color.` };
+        }
+        if (!Number.isFinite(str.baseWidth) || str.baseWidth <= 0) {
+          return { error: `Stroke "${str.id}" has non-positive or non-finite baseWidth.` };
+        }
+        if (!Number.isFinite(str.opacity) || str.opacity < 0 || str.opacity > 1) {
+          return { error: `Stroke "${str.id}" has opacity outside [0, 1].` };
+        }
+
+        // Validate bounds
+        if (
+          !str.bounds ||
+          typeof str.bounds !== 'object' ||
+          !Number.isFinite(str.bounds.minX) ||
+          !Number.isFinite(str.bounds.minY) ||
+          !Number.isFinite(str.bounds.maxX) ||
+          !Number.isFinite(str.bounds.maxY) ||
+          str.bounds.minX > str.bounds.maxX ||
+          str.bounds.minY > str.bounds.maxY
+        ) {
+          return { error: `Stroke "${str.id}" has invalid or inverted bounds.` };
+        }
+
+        // Validate points
+        if (!Array.isArray(str.points) || str.points.length === 0) {
+          return { error: `Stroke "${str.id}" points array is missing or empty.` };
+        }
+
+        for (let ptIdx = 0; ptIdx < str.points.length; ptIdx++) {
+          const pt = str.points[ptIdx];
+          if (
+            !pt ||
+            !Number.isFinite(pt.x) ||
+            !Number.isFinite(pt.y) ||
+            !Number.isFinite(pt.pressure) ||
+            pt.pressure < 0 ||
+            pt.pressure > 1 ||
+            !Number.isFinite(pt.tiltX) ||
+            !Number.isFinite(pt.tiltY) ||
+            !Number.isFinite(pt.timestamp)
+          ) {
+            return { error: `Stroke "${str.id}" point #${ptIdx} has non-finite coordinates or out-of-range pressure.` };
+          }
+        }
       }
-      if (!page.backgroundPattern) {
-        page.backgroundPattern = 'lined';
-      }
-      if (!page.gridSpacing) {
-        page.gridSpacing = 28;
+
+      // Validate Text Notes
+      if (typeof page.textNotes !== 'undefined') {
+        if (!Array.isArray(page.textNotes)) {
+          return { error: `Page "${page.title}" textNotes must be an array.` };
+        }
+        const noteIdSet = new Set<string>();
+        for (let nIdx = 0; nIdx < page.textNotes.length; nIdx++) {
+          const note = page.textNotes[nIdx];
+          if (!note || typeof note !== 'object') {
+            return { error: `Text note #${nIdx} on page "${page.title}" is invalid.` };
+          }
+          if (typeof note.id !== 'string' || !note.id.trim()) {
+            return { error: `Text note #${nIdx} on page "${page.title}" missing "id".` };
+          }
+          if (noteIdSet.has(note.id)) {
+            return { error: `Duplicate text note ID "${note.id}" on page "${page.title}".` };
+          }
+          noteIdSet.add(note.id);
+
+          if (!Number.isFinite(note.x) || !Number.isFinite(note.y)) {
+            return { error: `Text note "${note.id}" coordinates must be finite numbers.` };
+          }
+          if (!Number.isFinite(note.width) || note.width <= 0) {
+            return { error: `Text note "${note.id}" width must be a positive finite number.` };
+          }
+          if (typeof note.text !== 'string') {
+            return { error: `Text note "${note.id}" text must be a string.` };
+          }
+        }
       }
     }
   }
 
-  // Ensure active IDs point to existing section and page
-  const sectionIds = new Set(rawNotebook.sections.map((s: SectionData) => s.id));
-  let activeSectionId = rawNotebook.activeSectionId;
-  if (!activeSectionId || !sectionIds.has(activeSectionId)) {
-    activeSectionId = rawNotebook.sections[0].id;
+  // Verify activeSectionId and activePageId
+  if (typeof rawNotebook.activeSectionId !== 'string' || !sectionIdSet.has(rawNotebook.activeSectionId)) {
+    return { error: `activeSectionId "${rawNotebook.activeSectionId}" does not exist in sections.` };
   }
 
-  const activeSec = rawNotebook.sections.find((s: SectionData) => s.id === activeSectionId)!;
-  const pageIds = new Set(activeSec.pages.map((p: PageData) => p.id));
-  let activePageId = rawNotebook.activePageId;
-  if (!activePageId || !pageIds.has(activePageId)) {
-    activePageId = activeSec.pages[0].id;
+  const activeSec = rawNotebook.sections.find((s: any) => s.id === rawNotebook.activeSectionId)!;
+  const activeSecPageIds = new Set(activeSec.pages.map((p: any) => p.id));
+  if (typeof rawNotebook.activePageId !== 'string' || !activeSecPageIds.has(rawNotebook.activePageId)) {
+    return { error: `activePageId "${rawNotebook.activePageId}" does not exist in section "${activeSec.title}".` };
   }
 
-  const notebook: NotebookData = {
-    id: rawNotebook.id && typeof rawNotebook.id === 'string' ? rawNotebook.id : `nb_${Date.now()}`,
+  const cleanNotebook: NotebookData = {
+    id: rawNotebook.id,
     title: rawNotebook.title.trim(),
-    color: rawNotebook.color || '#4f46e5',
-    createdAt: typeof rawNotebook.createdAt === 'number' ? rawNotebook.createdAt : Date.now(),
+    color: typeof rawNotebook.color === 'string' ? rawNotebook.color : '#4f46e5',
+    createdAt: typeof rawNotebook.createdAt === 'number' && Number.isFinite(rawNotebook.createdAt) ? rawNotebook.createdAt : Date.now(),
     updatedAt: Date.now(),
     sections: rawNotebook.sections,
-    activeSectionId,
-    activePageId,
+    activeSectionId: rawNotebook.activeSectionId,
+    activePageId: rawNotebook.activePageId,
   };
 
-  return { notebook };
+  return { notebook: cleanNotebook };
 }
 
 export function createBackupEnvelope(notebook: NotebookData): BackupEnvelope {

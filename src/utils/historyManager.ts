@@ -72,7 +72,7 @@ export class BatchEraseCommand implements IPageCommand {
 
   constructor(
     public pageId: string,
-    public removedStrokes: { stroke: StrokeData; index: number }[]
+    public removedStrokes: { stroke: StrokeData; originalIndex: number }[]
   ) {
     this.id = `cmd_erase_${Date.now()}`;
     const count = removedStrokes.length;
@@ -92,22 +92,21 @@ export class BatchEraseCommand implements IPageCommand {
 
   undo(page: PageData): PageData {
     if (page.id !== this.pageId) return page;
-    // Restore strokes at their original positions if possible
-    const current = [...page.strokes];
-    // Sort by original index
-    const sorted = [...this.removedStrokes].sort((a, b) => a.index - b.index);
+    const idsToRestore = new Set(this.removedStrokes.map((r) => r.stroke.id));
+    const surviving = page.strokes.filter((s) => !idsToRestore.has(s.id));
+
+    // Sort removed strokes strictly by original index at gesture start
+    const sorted = [...this.removedStrokes].sort((a, b) => a.originalIndex - b.originalIndex);
+    const restored = [...surviving];
+
     for (const item of sorted) {
-      if (!current.some((s) => s.id === item.stroke.id)) {
-        if (item.index >= 0 && item.index <= current.length) {
-          current.splice(item.index, 0, item.stroke);
-        } else {
-          current.push(item.stroke);
-        }
-      }
+      const targetIndex = Math.min(item.originalIndex, restored.length);
+      restored.splice(targetIndex, 0, item.stroke);
     }
+
     return {
       ...page,
-      strokes: current,
+      strokes: restored,
       updatedAt: Date.now(),
     };
   }
@@ -247,10 +246,6 @@ export class UpdateTextNoteCommand implements IPageCommand {
   }
 }
 
-/**
- * Page-scoped History Manager.
- * Operates purely on explicit page ID and immutable state transformations.
- */
 export class PageHistoryManager {
   private undoStack: IPageCommand[] = [];
   private redoStack: IPageCommand[] = [];
@@ -349,6 +344,12 @@ export class PageHistoryManager {
     return timeline;
   }
 
+  clear(): void {
+    this.undoStack = [];
+    this.redoStack = [];
+    this.notify();
+  }
+
   subscribe(callback: () => void): () => void {
     this.onChangeCallbacks.push(callback);
     return () => {
@@ -363,10 +364,6 @@ export class PageHistoryManager {
   }
 }
 
-/**
- * Registry maintaining page-scoped histories.
- * Guarantees that Page B never touches Page A's history or content.
- */
 export class PageHistoryRegistry {
   private managers = new Map<string, PageHistoryManager>();
 
@@ -381,5 +378,12 @@ export class PageHistoryRegistry {
 
   removePage(pageId: string): void {
     this.managers.delete(pageId);
+  }
+
+  resetAll(): void {
+    for (const mgr of this.managers.values()) {
+      mgr.clear();
+    }
+    this.managers.clear();
   }
 }
