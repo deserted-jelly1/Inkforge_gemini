@@ -242,16 +242,13 @@ export class SampleBasedHandwritingRenderer implements IHandwritingRenderer {
   }
 }
 
-/**
- * Exports multiple rendered pages into a genuine vector PDF.
- * Uses native vector line, circle, rect, and text PDF commands.
- */
-export function exportPagesToPDF(
+export function createVectorPDFDocument(
   pages: LayoutPage[],
-  renderer: IHandwritingRenderer,
-  documentTitle = 'Handwriting_Document'
-): void {
-  if (pages.length === 0) return;
+  renderer: IHandwritingRenderer
+): jsPDF {
+  if (pages.length === 0) {
+    return new jsPDF();
+  }
 
   const firstPage = pages[0];
   const pdf = new jsPDF({
@@ -309,15 +306,17 @@ export function exportPagesToPDF(
           pdf.setFillColor(r, g, b);
           pdf.setDrawColor(r, g, b);
           pdf.setLineDashPattern([], 0);
+          pdf.setLineCap(1);
+          pdf.setLineJoin(1);
 
           // Vector dots
           for (const dot of geom.dots) {
             pdf.circle(dot.x, dot.y, dot.radius, 'F');
           }
 
-          // Vector line segments
+          // Vector line segments with un-clamped dynamic width matching Canvas and SVG
           for (const seg of geom.segments) {
-            pdf.setLineWidth(Math.max(0.5, seg.width));
+            pdf.setLineWidth(Math.max(0.05, seg.width));
             pdf.line(seg.x1, seg.y1, seg.x2, seg.y2);
           }
         }
@@ -325,6 +324,20 @@ export function exportPagesToPDF(
     }
   }
 
+  return pdf;
+}
+
+/**
+ * Exports multiple rendered pages into a genuine vector PDF.
+ * Uses native vector line, circle, rect, and text PDF commands.
+ */
+export function exportPagesToPDF(
+  pages: LayoutPage[],
+  renderer: IHandwritingRenderer,
+  documentTitle = 'Handwriting_Document'
+): void {
+  if (pages.length === 0) return;
+  const pdf = createVectorPDFDocument(pages, renderer);
   const safeTitle = documentTitle.replace(/[^a-zA-Z0-9_-]/g, '_');
   pdf.save(`InkForge_${safeTitle}.pdf`);
 }

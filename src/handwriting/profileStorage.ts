@@ -1,9 +1,19 @@
-import { HandwritingProfile, CharacterSample, RawSampleStroke, ComposerDocument } from './types';
-import { populateStarterAlphabet } from './defaultGlyphs';
+import {
+  HandwritingProfile,
+  CharacterSample,
+  RawSampleStroke,
+  ComposerDocument,
+  LayoutOptions,
+} from './types';
+import {
+  populateStarterAlphabet,
+  isUntouchedStarterSample,
+} from './defaultGlyphs';
 
 const PROFILES_DB_NAME = 'inkforge_profiles_db';
 const PROFILES_DB_VERSION = 2;
 const PROFILES_STORE = 'profiles';
+const BACKUP_STORE = 'profiles_backup';
 const DRAFTS_STORE = 'drafts';
 const ACTIVE_DRAFT_KEY = 'active_composer_draft';
 
@@ -17,73 +27,160 @@ export type LoadDraftResult =
   | { status: 'not_found' }
   | { status: 'error'; error: string };
 
-function openProfilesDatabase(): Promise<IDBDatabase> {
+let cachedDB: IDBDatabase | null = null;
+
+export function closeProfilesDatabase(): void {
+  if (cachedDB) {
+    try {
+      cachedDB.close();
+    } catch {
+      // ignore
+    }
+    cachedDB = null;
+  }
+}
+
+export function openProfilesDatabase(): Promise<IDBDatabase> {
+  if (cachedDB) {
+    return Promise.resolve(cachedDB);
+  }
+
   return new Promise((resolve, reject) => {
     if (typeof indexedDB === 'undefined') {
       reject(new Error('IndexedDB is not supported in this environment.'));
       return;
     }
+
     const request = indexedDB.open(PROFILES_DB_NAME, PROFILES_DB_VERSION);
+
+    request.onblocked = () => {
+      reject(
+        new Error(
+          'Database upgrade blocked. Please close any other open InkForge tabs to allow database upgrade.'
+        )
+      );
+    };
 
     request.onupgradeneeded = (event) => {
       const db = (event.target as IDBOpenDBRequest).result;
       if (!db.objectStoreNames.contains(PROFILES_STORE)) {
         db.createObjectStore(PROFILES_STORE, { keyPath: 'id' });
       }
+      if (!db.objectStoreNames.contains(BACKUP_STORE)) {
+        db.createObjectStore(BACKUP_STORE, { keyPath: 'id' });
+      }
       if (!db.objectStoreNames.contains(DRAFTS_STORE)) {
         db.createObjectStore(DRAFTS_STORE);
       }
     };
 
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error || new Error('Failed to open profiles database.'));
+    request.onsuccess = () => {
+      const db = request.result;
+      cachedDB = db;
+
+      db.onversionchange = () => {
+        closeProfilesDatabase();
+      };
+
+      db.onclose = () => {
+        cachedDB = null;
+      };
+
+      resolve(db);
+    };
+
+    request.onerror = () => {
+      reject(request.error || new Error('Failed to open profiles database.'));
+    };
   });
 }
 
 /**
- * Checks if a sample is a synthetic starter sample.
+ * Validates whether a sample is an untouched synthetic starter sample
+ * by comparing stroke geometry directly against canonical coordinates.
  */
-export function isStarterSample(sample: CharacterSample): boolean {
-  return (
-    sample.isStarter === true ||
-    sample.id.endsWith('_starter') ||
-    sample.id.startsWith('sample_starter') ||
-    sample.id.startsWith('starter_')
-  );
+export function isStarterSample(sample: CharacterSample, char = ''): boolean {
+  if (!sample) return false;
+  return isUntouchedStarterSample(sample, char);
 }
 
 /**
- * Safely migrates existing profiles: removes synthetic starter samples from personal profiles
- * while preserving every user-created sample.
+ * Safely migrates existing profiles:
+ * - Checks legacy sample geometry against canonical starter samples.
+ * - Removes ONLY confidently identified, UNTOUCHED synthetic starter samples from personal profiles.
+ * - Preserves edited or ambiguous samples, relabeling them as user_edited with needsReview: true.
+ * - Saves a recoverable backup in profiles_backup before applying any mutation.
+ * - Idempotent: running multiple times leaves already-migrated profiles untouched.
  */
-export function migrateProfile(profile: HandwritingProfile): { profile: HandwritingProfile; migrated: boolean } {
-  // If explicitly a demo profile, leave demo samples
+export function migrateProfile(profile: HandwritingProfile): {
+  profile: HandwritingProfile;
+  migrated: boolean;
+  backupToSave?: HandwritingProfile;
+} {
   if (profile.isDemo) {
     return { profile, migrated: false };
   }
 
-  let hasStarterSamples = false;
+  let hasChanges = false;
+  const originalGlyphsCopy = JSON.parse(JSON.stringify(profile.glyphs));
   const cleanedGlyphs: Record<string, CharacterSample[]> = {};
 
   for (const [char, samples] of Object.entries(profile.glyphs)) {
     if (!Array.isArray(samples)) continue;
-    const userSamples = samples.filter((s) => !isStarterSample(s));
-    if (userSamples.length !== samples.length) {
-      hasStarterSamples = true;
+
+    const preservedSamples: CharacterSample[] = [];
+
+    for (const sample of samples) {
+      const untouchedStarter = isUntouchedStarterSample(sample, char);
+
+      if (untouchedStarter) {
+        // Confidently identified untouched synthetic starter sample -> remove from personal profile
+        hasChanges = true;
+      } else {
+        // Either user-created or edited legacy sample
+        if (sample.id.endsWith('_starter') || sample.isStarter) {
+          // Edited starter retaining original ID! Preserve user work and relabel provenance
+          hasChanges = true;
+          preservedSamples.push({
+            ...sample,
+            id: `migrated_user_${char}_${sample.id.replace(/_starter$/, '')}_${Date.now()}`,
+            isStarter: false,
+            provenance: 'user_edited',
+            needsReview: true,
+          });
+        } else {
+          // Genuine user sample
+          preservedSamples.push({
+            ...sample,
+            provenance: sample.provenance || 'user_captured',
+          });
+        }
+      }
     }
-    if (userSamples.length > 0) {
-      cleanedGlyphs[char] = userSamples;
+
+    if (preservedSamples.length > 0) {
+      cleanedGlyphs[char] = preservedSamples;
     }
   }
 
-  if (hasStarterSamples) {
+  if (hasChanges) {
+    const backup: HandwritingProfile = {
+      ...profile,
+      id: `${profile.id}_pre_migration_${Date.now()}`,
+      updatedAt: Date.now(),
+    };
+
+    const migratedProfile: HandwritingProfile = {
+      ...profile,
+      glyphs: cleanedGlyphs,
+      legacyBackup: originalGlyphsCopy,
+      updatedAt: Date.now(),
+    };
+
     return {
-      profile: {
-        ...profile,
-        glyphs: cleanedGlyphs,
-        updatedAt: Date.now(),
-      },
+      profile: migratedProfile,
       migrated: true,
+      backupToSave: backup,
     };
   }
 
@@ -91,15 +188,16 @@ export function migrateProfile(profile: HandwritingProfile): { profile: Handwrit
 }
 
 /**
- * Loads all profiles from IndexedDB with explicit error/empty separation.
+ * Loads all profiles from IndexedDB with failure / empty separation.
  */
 export async function listProfiles(): Promise<LoadProfilesResult> {
   try {
     const db = await openProfilesDatabase();
     return new Promise((resolve) => {
       try {
-        const tx = db.transaction(PROFILES_STORE, 'readonly');
+        const tx = db.transaction([PROFILES_STORE, BACKUP_STORE], 'readwrite');
         const store = tx.objectStore(PROFILES_STORE);
+        const backupStore = tx.objectStore(BACKUP_STORE);
         const req = store.getAll();
 
         req.onsuccess = () => {
@@ -109,20 +207,16 @@ export async function listProfiles(): Promise<LoadProfilesResult> {
             return;
           }
 
-          // Apply migration to ensure personal profiles contain only user samples
           const migratedList: HandwritingProfile[] = [];
-          let needsSave = false;
 
           for (const p of rawProfiles) {
-            const { profile: cleanP, migrated } = migrateProfile(p);
+            const { profile: cleanP, migrated, backupToSave } = migrateProfile(p);
             migratedList.push(cleanP);
-            if (migrated) needsSave = true;
-          }
-
-          if (needsSave) {
-            // Asynchronously persist clean profiles
-            for (const p of migratedList) {
-              saveProfile(p).catch(console.error);
+            if (migrated) {
+              store.put(cleanP);
+              if (backupToSave) {
+                backupStore.put(backupToSave);
+              }
             }
           }
 
@@ -130,18 +224,34 @@ export async function listProfiles(): Promise<LoadProfilesResult> {
         };
 
         req.onerror = () => {
-          resolve({ status: 'error', error: req.error?.message || 'Failed reading profiles from store.' });
+          resolve({
+            status: 'error',
+            error: req.error?.message || 'Failed reading profiles store.',
+          });
         };
 
         tx.onerror = () => {
-          resolve({ status: 'error', error: tx.error?.message || 'Transaction failed reading profiles.' });
+          resolve({
+            status: 'error',
+            error: tx.error?.message || 'Transaction failed reading profiles.',
+          });
+        };
+
+        tx.onabort = () => {
+          resolve({
+            status: 'error',
+            error: 'Transaction aborted while reading profiles.',
+          });
         };
       } catch (err: any) {
-        resolve({ status: 'error', error: err?.message || 'Failed opening transaction.' });
+        resolve({
+          status: 'error',
+          error: err?.message || 'Failed opening readwrite profiles transaction.',
+        });
       }
     });
   } catch (err: any) {
-    return { status: 'error', error: err?.message || 'Failed connecting to database.' };
+    return { status: 'error', error: err?.message || 'Failed opening database.' };
   }
 }
 
@@ -162,7 +272,10 @@ export async function loadProfile(id: string): Promise<HandwritingProfile | null
         const { profile: cleanP } = migrateProfile(result);
         resolve(cleanP);
       };
+
       req.onerror = () => reject(req.error);
+      tx.onabort = () => reject(new Error('Transaction aborted'));
+      tx.onerror = () => reject(tx.error);
     });
   } catch (err) {
     console.error('Failed to load profile:', err);
@@ -179,7 +292,7 @@ export async function saveProfile(profile: HandwritingProfile): Promise<void> {
       store.put(profile);
 
       tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error || new Error('Failed saving profile transaction.'));
+      tx.onerror = () => reject(tx.error || new Error('Failed saving profile.'));
       tx.onabort = () => reject(new Error('Profile transaction aborted.'));
     } catch (err) {
       reject(err);
@@ -196,7 +309,7 @@ export async function deleteProfile(id: string): Promise<void> {
       store.delete(id);
 
       tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error || new Error('Failed deleting profile transaction.'));
+      tx.onerror = () => reject(tx.error || new Error('Failed deleting profile.'));
       tx.onabort = () => reject(new Error('Profile deletion aborted.'));
     } catch (err) {
       reject(err);
@@ -205,8 +318,83 @@ export async function deleteProfile(id: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Composer Draft Document Persistence
+// Composer Draft Document Persistence & Strict Validation
 // ---------------------------------------------------------------------------
+
+export function validateComposerDraft(data: any): { draft?: ComposerDocument; error?: string } {
+  if (!data || typeof data !== 'object') {
+    return { error: 'Draft root must be an object.' };
+  }
+
+  if (data.schemaVersion !== 1) {
+    return { error: `Unsupported draft schema version "${data.schemaVersion}". Expected 1.` };
+  }
+
+  if (typeof data.id !== 'string' || !data.id.trim()) {
+    return { error: 'Draft missing string ID.' };
+  }
+
+  if (typeof data.text !== 'string') {
+    return { error: 'Draft text must be a string.' };
+  }
+
+  if (!data.options || typeof data.options !== 'object') {
+    return { error: 'Draft missing layout options.' };
+  }
+
+  const { pageWidth, pageHeight, margins, fontSize, lineHeight, letterSpacing, wordSpacing } =
+    data.options;
+
+  if (!Number.isFinite(pageWidth) || pageWidth <= 0 || !Number.isFinite(pageHeight) || pageHeight <= 0) {
+    return { error: 'Draft has invalid page dimensions.' };
+  }
+
+  if (
+    !margins ||
+    typeof margins !== 'object' ||
+    !Number.isFinite(margins.top) ||
+    !Number.isFinite(margins.right) ||
+    !Number.isFinite(margins.bottom) ||
+    !Number.isFinite(margins.left)
+  ) {
+    return { error: 'Draft has invalid margins.' };
+  }
+
+  if (
+    !Number.isFinite(fontSize) ||
+    fontSize <= 0 ||
+    !Number.isFinite(lineHeight) ||
+    lineHeight <= 0 ||
+    !Number.isFinite(letterSpacing) ||
+    letterSpacing <= 0 ||
+    !Number.isFinite(wordSpacing) ||
+    wordSpacing <= 0
+  ) {
+    return { error: 'Draft has non-positive or non-finite typography values.' };
+  }
+
+  const cleanDraft: ComposerDocument = {
+    schemaVersion: 1,
+    id: data.id.trim(),
+    title: typeof data.title === 'string' ? data.title : 'Handwriting Draft',
+    text: data.text,
+    profileId: typeof data.profileId === 'string' ? data.profileId : '',
+    options: {
+      pageWidth,
+      pageHeight,
+      margins,
+      fontSize,
+      lineHeight,
+      letterSpacing,
+      wordSpacing,
+    },
+    createdAt: typeof data.createdAt === 'number' && Number.isFinite(data.createdAt) ? data.createdAt : Date.now(),
+    updatedAt: typeof data.updatedAt === 'number' && Number.isFinite(data.updatedAt) ? data.updatedAt : Date.now(),
+    revision: typeof data.revision === 'number' && Number.isFinite(data.revision) ? data.revision : 1,
+  };
+
+  return { draft: cleanDraft };
+}
 
 export async function loadActiveDraft(): Promise<LoadDraftResult> {
   try {
@@ -218,15 +406,28 @@ export async function loadActiveDraft(): Promise<LoadDraftResult> {
         const req = store.get(ACTIVE_DRAFT_KEY);
 
         req.onsuccess = () => {
-          if (req.result) {
-            resolve({ status: 'found', draft: req.result as ComposerDocument });
-          } else {
+          if (!req.result) {
             resolve({ status: 'not_found' });
+            return;
+          }
+          const { draft, error } = validateComposerDraft(req.result);
+          if (error || !draft) {
+            resolve({ status: 'error', error: `Corrupt draft in storage: ${error}` });
+          } else {
+            resolve({ status: 'found', draft });
           }
         };
 
         req.onerror = () => {
           resolve({ status: 'error', error: req.error?.message || 'Failed reading active draft.' });
+        };
+
+        tx.onerror = () => {
+          resolve({ status: 'error', error: tx.error?.message || 'Transaction error reading draft.' });
+        };
+
+        tx.onabort = () => {
+          resolve({ status: 'error', error: 'Draft transaction aborted.' });
         };
       } catch (err: any) {
         resolve({ status: 'error', error: err?.message || 'Failed opening draft transaction.' });
@@ -377,9 +578,6 @@ export function validateAndParseProfile(jsonString: string): { profile?: Handwri
   return { profile: cleanProfile };
 }
 
-/**
- * Creates an empty personal profile with zero captured samples.
- */
 export function createNewPersonalProfile(name = 'My Handwriting'): HandwritingProfile {
   return {
     schemaVersion: 1,
@@ -396,9 +594,6 @@ export function createNewPersonalProfile(name = 'My Handwriting'): HandwritingPr
 
 export const createNewProfile = createNewPersonalProfile;
 
-/**
- * Creates the explicitly labeled separate demo profile populated with starter glyphs.
- */
 export function createDemoProfile(): HandwritingProfile {
   return {
     schemaVersion: 1,

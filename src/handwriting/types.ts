@@ -1,5 +1,11 @@
 import { VectorPoint } from '../types/inkforge';
 
+export type SampleProvenance =
+  | 'user_captured'
+  | 'user_edited'
+  | 'synthetic_starter'
+  | 'migrated_review';
+
 export interface RawSampleStroke {
   id: string;
   points: VectorPoint[];
@@ -16,6 +22,8 @@ export interface CharacterSample {
   capHeightY: number;
   xHeightY: number;
   isStarter?: boolean;
+  provenance?: SampleProvenance;
+  needsReview?: boolean;
 }
 
 export interface HandwritingProfile {
@@ -27,6 +35,7 @@ export interface HandwritingProfile {
   updatedAt: number;
   description?: string;
   isDemo?: boolean;
+  legacyBackup?: Record<string, CharacterSample[]>;
   glyphs: Record<string, CharacterSample[]>;
 }
 
@@ -39,6 +48,7 @@ export interface ComposerDocument {
   options: LayoutOptions;
   createdAt: number;
   updatedAt: number;
+  revision?: number;
 }
 
 export interface NormalizedGlyphSample {

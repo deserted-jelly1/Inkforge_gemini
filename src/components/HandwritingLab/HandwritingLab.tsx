@@ -7,21 +7,26 @@ import {
   createNewPersonalProfile,
   createDemoProfile,
   validateAndParseProfile,
-  loadActiveDraft,
-  saveActiveDraft,
 } from '../../handwriting/profileStorage';
+import {
+  getOrLoadActiveDraft,
+  updateDraft,
+  flushDraftSave,
+  subscribeDraft,
+  DraftSaveStatus,
+} from '../../handwriting/draftManager';
 import { PRESET_TEXTS } from './DocumentComposer';
 import { ProfileManager } from './ProfileManager';
 import { CaptureStudio } from './CaptureStudio';
 import { DocumentComposer } from './DocumentComposer';
-import { Info, PenTool, FileText, AlertCircle, X, RefreshCw } from 'lucide-react';
+import { Info, PenTool, FileText, AlertCircle, X, RefreshCw, Download } from 'lucide-react';
 
 export const HandwritingLab: React.FC = () => {
   const [profiles, setProfiles] = useState<HandwritingProfile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState<string>('');
   const [activeLabTab, setActiveLabTab] = useState<'compose' | 'capture'>('compose');
 
-  // Draft persistence state
+  // Draft state managed via draftManager
   const [draft, setDraft] = useState<ComposerDocument>({
     schemaVersion: 1,
     id: 'composer_draft_active',
@@ -40,20 +45,35 @@ export const HandwritingLab: React.FC = () => {
     createdAt: Date.now(),
     updatedAt: Date.now(),
   });
+  const [draftSaveStatus, setDraftSaveStatus] = useState<DraftSaveStatus>('idle');
+  const [draftLoadError, setDraftLoadError] = useState<string | null>(null);
 
-  const [draftSaveStatus, setDraftSaveStatus] = useState<'idle' | 'saving' | 'error'>('idle');
+  // Profile status tracking
+  const [profileSaveStatus, setProfileSaveStatus] = useState<'idle' | 'saving' | 'error'>('idle');
+  const [profileErrorMessage, setProfileErrorMessage] = useState<string | null>(null);
   const [profileLoadError, setProfileLoadError] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const [isLoaded, setIsLoaded] = useState<boolean>(false);
 
-  // Debounce refs for draft and profile autosaves
-  const draftSaveTimeoutRef = useRef<any>(null);
-  const draftSaveSeqRef = useRef<number>(0);
-  const pendingDraftRef = useRef<ComposerDocument>(draft);
+  // Monotonic profile save sequence tracking
+  const profileSaveSeqRef = useRef<number>(0);
 
-  // Load profiles and draft on mount
+  // Subscribe to navigation-safe draft manager
+  useEffect(() => {
+    const unsubscribe = subscribeDraft((updatedDraft, status) => {
+      setDraft(updatedDraft);
+      setDraftSaveStatus(status);
+    });
+    return () => {
+      unsubscribe();
+      flushDraftSave().catch(console.error);
+    };
+  }, []);
+
+  // Initial Load with explicit status separation
   const loadLabData = useCallback(async () => {
     setProfileLoadError(null);
+    setDraftLoadError(null);
     setIsLoaded(false);
 
     try {
@@ -63,60 +83,38 @@ export const HandwritingLab: React.FC = () => {
       if (profileRes.status === 'found') {
         loadedProfiles = profileRes.profiles;
       } else if (profileRes.status === 'empty') {
-        // Initialize starter demo profile and an empty personal profile
+        // Seed only when confirmed empty
         const demo = createDemoProfile();
         const initialPersonal = createNewPersonalProfile('My Handwriting');
         await saveProfile(demo);
         await saveProfile(initialPersonal);
         loadedProfiles = [demo, initialPersonal];
       } else if (profileRes.status === 'error') {
+        // On error: preserve storage, do NOT seed, show retry
         setProfileLoadError(profileRes.error);
         setIsLoaded(true);
         return;
       }
 
       setProfiles(loadedProfiles);
-      // Select the personal profile by default if present, else first profile
       const defaultPersonal = loadedProfiles.find((p) => !p.isDemo) || loadedProfiles[0];
       const initialActiveId = defaultPersonal ? defaultPersonal.id : '';
       setActiveProfileId(initialActiveId);
 
-      // Load active composer draft from IndexedDB
-      const draftRes = await loadActiveDraft();
-      if (draftRes.status === 'found') {
+      // Load draft safely through draftManager
+      const draftRes = await getOrLoadActiveDraft(initialActiveId);
+      if (draftRes.status === 'error') {
+        setDraftLoadError(draftRes.error || 'Failed loading composer draft.');
+      } else {
         setDraft(draftRes.draft);
-        pendingDraftRef.current = draftRes.draft;
         if (draftRes.draft.profileId && loadedProfiles.some((p) => p.id === draftRes.draft.profileId)) {
           setActiveProfileId(draftRes.draft.profileId);
         }
-      } else {
-        // Create initial draft
-        const initDraft: ComposerDocument = {
-          schemaVersion: 1,
-          id: 'composer_draft_active',
-          title: 'Handwriting Draft',
-          text: PRESET_TEXTS[0].text,
-          profileId: initialActiveId,
-          options: {
-            pageWidth: 595,
-            pageHeight: 842,
-            margins: { top: 48, right: 48, bottom: 48, left: 48 },
-            fontSize: 24,
-            lineHeight: 1.5,
-            letterSpacing: 1.0,
-            wordSpacing: 1.0,
-          },
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-        };
-        setDraft(initDraft);
-        pendingDraftRef.current = initDraft;
-        saveActiveDraft(initDraft).catch(console.error);
       }
 
       setIsLoaded(true);
     } catch (err: any) {
-      setProfileLoadError(err?.message || 'Failed initializing Handwriting Lab storage.');
+      setProfileLoadError(err?.message || 'Storage error loading Handwriting Lab.');
       setIsLoaded(true);
     }
   }, []);
@@ -125,61 +123,54 @@ export const HandwritingLab: React.FC = () => {
     loadLabData();
   }, [loadLabData]);
 
-  // Debounced draft autosave
-  const triggerDraftSave = useCallback((updatedDraft: ComposerDocument) => {
-    setDraft(updatedDraft);
-    pendingDraftRef.current = updatedDraft;
-    setDraftSaveStatus('saving');
-
-    const currentSeq = ++draftSaveSeqRef.current;
-    if (draftSaveTimeoutRef.current) {
-      clearTimeout(draftSaveTimeoutRef.current);
-    }
-
-    draftSaveTimeoutRef.current = setTimeout(() => {
-      saveActiveDraft(pendingDraftRef.current)
-        .then(() => {
-          if (currentSeq >= draftSaveSeqRef.current) {
-            setDraftSaveStatus('idle');
-          }
-        })
-        .catch((err) => {
-          console.error('Draft autosave failed:', err);
-          setDraftSaveStatus('error');
-        });
-    }, 600);
-  }, []);
-
-  const handleRetrySaveDraft = () => {
-    const currentSeq = ++draftSaveSeqRef.current;
-    setDraftSaveStatus('saving');
-    saveActiveDraft(pendingDraftRef.current)
-      .then(() => {
-        if (currentSeq >= draftSaveSeqRef.current) {
-          setDraftSaveStatus('idle');
-        }
-      })
-      .catch(() => setDraftSaveStatus('error'));
-  };
-
   const activeProfile =
     profiles.find((p) => p.id === activeProfileId) || profiles[0] || null;
 
-  // Profile operations
+  // Profile operations with monotonic revisions & error reporting
   const handleUpdateProfile = useCallback((updated: HandwritingProfile) => {
+    const currentSeq = ++profileSaveSeqRef.current;
     setProfiles((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
-    saveProfile(updated).catch(console.error);
+    setProfileSaveStatus('saving');
+    setProfileErrorMessage(null);
+
+    saveProfile(updated)
+      .then(() => {
+        if (currentSeq >= profileSaveSeqRef.current) {
+          setProfileSaveStatus('idle');
+        }
+      })
+      .catch((err) => {
+        if (currentSeq >= profileSaveSeqRef.current) {
+          setProfileSaveStatus('error');
+          setProfileErrorMessage(err.message || 'Failed saving profile.');
+        }
+      });
   }, []);
+
+  const handleRetryProfileSave = () => {
+    if (!activeProfile) return;
+    handleUpdateProfile(activeProfile);
+  };
 
   const handleCreatePersonalProfile = (name?: string) => {
     const profileName = name && name.trim() ? name.trim() : 'My Handwriting';
-    // Personal profiles start completely empty
     const newProf = createNewPersonalProfile(profileName);
-    saveProfile(newProf).then(() => {
-      setProfiles((prev) => [...prev, newProf]);
-      setActiveProfileId(newProf.id);
-      triggerDraftSave({ ...draft, profileId: newProf.id });
-    });
+    const currentSeq = ++profileSaveSeqRef.current;
+    setProfileSaveStatus('saving');
+
+    saveProfile(newProf)
+      .then(() => {
+        if (currentSeq >= profileSaveSeqRef.current) {
+          setProfiles((prev) => [...prev, newProf]);
+          setActiveProfileId(newProf.id);
+          setProfileSaveStatus('idle');
+          updateDraft({ ...draft, profileId: newProf.id });
+        }
+      })
+      .catch((err) => {
+        setProfileSaveStatus('error');
+        setProfileErrorMessage(`Failed creating profile: ${err.message}`);
+      });
   };
 
   const handleRenameProfile = (id: string, newName: string) => {
@@ -190,18 +181,29 @@ export const HandwritingLab: React.FC = () => {
   };
 
   const handleDeleteProfile = (id: string) => {
-    deleteProfile(id).then(() => {
-      const remaining = profiles.filter((p) => p.id !== id);
-      setProfiles(remaining);
-      const nextActiveId = remaining.length > 0 ? remaining[0].id : '';
-      setActiveProfileId(nextActiveId);
-      triggerDraftSave({ ...draft, profileId: nextActiveId });
-    });
+    const currentSeq = ++profileSaveSeqRef.current;
+    setProfileSaveStatus('saving');
+
+    deleteProfile(id)
+      .then(() => {
+        if (currentSeq >= profileSaveSeqRef.current) {
+          const remaining = profiles.filter((p) => p.id !== id);
+          setProfiles(remaining);
+          const nextActiveId = remaining.length > 0 ? remaining[0].id : '';
+          setActiveProfileId(nextActiveId);
+          setProfileSaveStatus('idle');
+          updateDraft({ ...draft, profileId: nextActiveId });
+        }
+      })
+      .catch((err) => {
+        setProfileSaveStatus('error');
+        setProfileErrorMessage(`Failed deleting profile: ${err.message}`);
+      });
   };
 
   const handleSelectProfile = (id: string) => {
     setActiveProfileId(id);
-    triggerDraftSave({ ...draft, profileId: id });
+    updateDraft({ ...draft, profileId: id });
   };
 
   const handleExportProfile = () => {
@@ -228,20 +230,31 @@ export const HandwritingLab: React.FC = () => {
         return;
       }
 
-      saveProfile(validated).then(() => {
-        setProfiles((prev) => {
-          const filtered = prev.filter((p) => p.id !== validated.id);
-          return [...filtered, validated];
+      const currentSeq = ++profileSaveSeqRef.current;
+      setProfileSaveStatus('saving');
+
+      saveProfile(validated)
+        .then(() => {
+          if (currentSeq >= profileSaveSeqRef.current) {
+            setProfiles((prev) => {
+              const filtered = prev.filter((p) => p.id !== validated.id);
+              return [...filtered, validated];
+            });
+            setActiveProfileId(validated.id);
+            setProfileSaveStatus('idle');
+            updateDraft({ ...draft, profileId: validated.id });
+          }
+        })
+        .catch((err) => {
+          setProfileSaveStatus('error');
+          setProfileErrorMessage(`Failed importing profile: ${err.message}`);
         });
-        setActiveProfileId(validated.id);
-        triggerDraftSave({ ...draft, profileId: validated.id });
-      });
     };
     reader.onerror = () => setImportError('Failed to read profile file from disk.');
     reader.readAsText(file);
   };
 
-  // Recoverable error view if IndexedDB read fails
+  // Recoverable error view if profile IndexedDB read fails
   if (profileLoadError) {
     return (
       <div className="w-full h-full flex flex-col items-center justify-center bg-neutral-50 p-6 text-neutral-800 font-sans">
@@ -295,7 +308,10 @@ export const HandwritingLab: React.FC = () => {
         {/* Workspace Sub-tabs */}
         <div className="flex items-center gap-1 shrink-0 self-end md:self-center">
           <button
-            onClick={() => setActiveLabTab('compose')}
+            onClick={() => {
+              flushDraftSave();
+              setActiveLabTab('compose');
+            }}
             className={`flex items-center gap-1.5 px-3 py-1 rounded text-xs transition-colors ${
               activeLabTab === 'compose'
                 ? 'bg-indigo-600 text-white font-semibold shadow-xs'
@@ -307,7 +323,10 @@ export const HandwritingLab: React.FC = () => {
           </button>
 
           <button
-            onClick={() => setActiveLabTab('capture')}
+            onClick={() => {
+              flushDraftSave();
+              setActiveLabTab('capture');
+            }}
             className={`flex items-center gap-1.5 px-3 py-1 rounded text-xs transition-colors ${
               activeLabTab === 'capture'
                 ? 'bg-indigo-600 text-white font-semibold shadow-xs'
@@ -320,7 +339,50 @@ export const HandwritingLab: React.FC = () => {
         </div>
       </div>
 
-      {/* 2. Error Banner */}
+      {/* 2. Profile Save Error Banner with Emergency Download & Retry */}
+      {profileSaveStatus === 'error' && (
+        <div className="bg-rose-50 border-b border-rose-200 px-4 py-2 flex items-center justify-between text-xs text-rose-800">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+            <span>{profileErrorMessage || 'Failed saving handwriting profile.'}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleExportProfile}
+              className="flex items-center gap-1 px-2 py-0.5 rounded bg-rose-100 hover:bg-rose-200 text-rose-900 font-medium transition-colors"
+              title="Export current in-memory profile as backup JSON"
+            >
+              <Download className="w-3 h-3" />
+              <span>Emergency Backup</span>
+            </button>
+            <button
+              onClick={handleRetryProfileSave}
+              className="flex items-center gap-1 px-2 py-0.5 rounded bg-rose-600 hover:bg-rose-700 text-white font-medium transition-colors"
+            >
+              <RefreshCw className="w-3 h-3" />
+              <span>Retry Save</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Draft Load Error Banner */}
+      {draftLoadError && (
+        <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 flex items-center justify-between text-xs text-amber-800">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span>{draftLoadError}</span>
+          </div>
+          <button
+            onClick={loadLabData}
+            className="underline font-medium text-amber-900 hover:text-amber-950"
+          >
+            Retry Load
+          </button>
+        </div>
+      )}
+
+      {/* Import Error Banner */}
       {importError && (
         <div className="bg-rose-50 border-b border-rose-200 px-4 py-2 flex items-center justify-between text-xs text-rose-800">
           <div className="flex items-center gap-2">
@@ -354,9 +416,9 @@ export const HandwritingLab: React.FC = () => {
           <DocumentComposer
             profile={activeProfile}
             draft={draft}
-            onUpdateDraft={triggerDraftSave}
+            onUpdateDraft={updateDraft}
             draftSaveStatus={draftSaveStatus}
-            onRetrySaveDraft={handleRetrySaveDraft}
+            onRetrySaveDraft={() => flushDraftSave()}
           />
         ) : (
           <CaptureStudio

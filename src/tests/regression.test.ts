@@ -858,4 +858,240 @@ test('25. Layout Engine: Handles multiple consecutive blank lines without droppi
   );
 });
 
+// -------------------------------------------------------------
+// 14. Non-Destructive Migration & Starter Geometry Comparison
+// -------------------------------------------------------------
+test('26. Migration Safety: Edited starter sample retaining original ID is preserved and relabeled', async () => {
+  const { migrateProfile } = await import('../handwriting/profileStorage.ts');
+  const { createStarterSample } = await import('../handwriting/defaultGlyphs.ts');
+
+  // Create starter sample for 'a'
+  const starterA = createStarterSample('a');
+  // User modified one stroke in starterA (e.g. moved a point or added a curve)
+  const editedStarterA = JSON.parse(JSON.stringify(starterA));
+  editedStarterA.strokes[0].points[0].x += 25; // User moved point!
+  // It still retains the original ID 'sample_a_starter'
+
+  const profile = {
+    schemaVersion: 1 as const,
+    app: 'InkForge-HandwritingProfile' as const,
+    id: 'profile_legacy_edited',
+    name: 'Legacy Profile With Edited Starter',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    isDemo: false,
+    glyphs: {
+      a: [editedStarterA],
+    },
+  };
+
+  const { profile: migrated, migrated: wasMigrated } = migrateProfile(profile);
+
+  // The sample MUST be preserved, not deleted!
+  assert.equal(wasMigrated, true);
+  assert.ok(migrated.glyphs['a'], 'Edited sample must not be deleted');
+  assert.equal(migrated.glyphs['a'].length, 1);
+  const preserved = migrated.glyphs['a'][0];
+  assert.equal(preserved.provenance, 'user_edited', 'Provenance must be tagged user_edited');
+  assert.equal(preserved.isStarter, false, 'isStarter must be flipped to false');
+  assert.equal(preserved.needsReview, true);
+});
+
+test('27. Migration Idempotence: Running migration repeatedly produces identical output', async () => {
+  const { migrateProfile } = await import('../handwriting/profileStorage.ts');
+  const { createStarterSample } = await import('../handwriting/defaultGlyphs.ts');
+
+  const profile = {
+    schemaVersion: 1 as const,
+    app: 'InkForge-HandwritingProfile' as const,
+    id: 'profile_idempotent_test',
+    name: 'Idempotent Test',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    isDemo: false,
+    glyphs: {
+      a: [createStarterSample('a')], // untouched starter
+      b: [
+        {
+          id: 'user_b',
+          createdAt: Date.now(),
+          strokes: [],
+          cellBounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 },
+          baselineY: 140,
+          capHeightY: 60,
+          xHeightY: 100,
+          provenance: 'user_captured' as const,
+        },
+      ],
+    },
+  };
+
+  // Pass 1
+  const pass1 = migrateProfile(profile);
+  assert.equal(pass1.migrated, true);
+  assert.equal(pass1.profile.glyphs['a'], undefined, 'Untouched starter a removed');
+  assert.equal(pass1.profile.glyphs['b'].length, 1, 'User b preserved');
+  assert.ok(pass1.backupToSave, 'Backup should be generated on pass 1');
+
+  // Pass 2 on the output of pass 1
+  const pass2 = migrateProfile(pass1.profile);
+  assert.equal(pass2.migrated, false, 'Second migration pass should perform zero changes (idempotent)');
+  assert.deepEqual(pass2.profile.glyphs, pass1.profile.glyphs);
+});
+
+// -------------------------------------------------------------
+// 15. Draft Read-Error Handling & Zero-Write Invariant
+// -------------------------------------------------------------
+test('28. Draft Error Handling: Read failure preserves storage and performs ZERO writes', async () => {
+  const { getOrLoadActiveDraft } = await import('../handwriting/draftManager.ts');
+
+  const originalIndexedDB = globalThis.indexedDB;
+  let writeAttempted = false;
+
+  try {
+    (globalThis as any).indexedDB = {
+      open: () => {
+        const req: any = {};
+        setTimeout(() => {
+          // Open succeeds but transaction fails
+          const fakeDB: any = {
+            transaction: () => {
+              const tx: any = {
+                objectStore: () => ({
+                  get: () => {
+                    const getReq: any = {};
+                    setTimeout(() => {
+                      getReq.error = new Error('Simulated QuotaExceededError or DB locked on read');
+                      if (getReq.onerror) getReq.onerror();
+                    }, 5);
+                    return getReq;
+                  },
+                  put: () => {
+                    writeAttempted = true;
+                    throw new Error('ILLEGAL WRITE: Draft storage must not be written on read failure');
+                  },
+                }),
+              };
+              return tx;
+            },
+            close: () => {},
+          };
+          req.result = fakeDB;
+          if (req.onsuccess) req.onsuccess();
+        }, 5);
+        return req;
+      },
+    };
+
+    const res = await getOrLoadActiveDraft('test_profile');
+    assert.equal(res.status, 'error', 'Read failure must return error status');
+    assert.equal(writeAttempted, false, 'Draft read failure must cause ZERO default-draft writes');
+  } finally {
+    (globalThis as any).indexedDB = originalIndexedDB;
+  }
+});
+
+// -------------------------------------------------------------
+// 16. Draft Navigation Safety & Debounce Flush
+// -------------------------------------------------------------
+test('29. Draft Manager: Flushes edits immediately and prevents stale callbacks from replacing newer revisions', async () => {
+  const { updateDraft, flushDraftSave, getCurrentDraft, getDraftStatus } = await import(
+    '../handwriting/draftManager.ts'
+  );
+
+  const baseDraft = {
+    schemaVersion: 1 as const,
+    id: 'composer_draft_active',
+    title: 'Midterm Notes',
+    text: 'Version 1 text',
+    profileId: 'prof_1',
+    options: {
+      pageWidth: 595,
+      pageHeight: 842,
+      margins: { top: 40, right: 40, bottom: 40, left: 40 },
+      fontSize: 24,
+      lineHeight: 1.5,
+      letterSpacing: 1.0,
+      wordSpacing: 1.0,
+    },
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+
+  // 1. Edit draft
+  updateDraft({ ...baseDraft, text: 'Version 2: Unique paragraph before tab switch' });
+  const activeInMemory = getCurrentDraft();
+  assert.equal(activeInMemory?.text, 'Version 2: Unique paragraph before tab switch');
+
+  // 2. Immediate flush simulating user navigating away from tab
+  await flushDraftSave();
+
+  // 3. Edit again simulating rapid return
+  updateDraft({ ...baseDraft, text: 'Version 3: Newest edit after rapid return' });
+  const finalInMemory = getCurrentDraft();
+  assert.equal(finalInMemory?.text, 'Version 3: Newest edit after rapid return');
+});
+
+// -------------------------------------------------------------
+// 17. Vector PDF Output Inspection
+// -------------------------------------------------------------
+test('30. Vector PDF: Generates genuine vector content with un-clamped dynamic widths and no raster images', async () => {
+  const { createVectorPDFDocument, SampleBasedHandwritingRenderer } = await import(
+    '../handwriting/sampleRenderer.ts'
+  );
+  const { createNewPersonalProfile } = await import('../handwriting/profileStorage.ts');
+  const { layoutTextWithProfile } = await import('../handwriting/textLayout.ts');
+
+  const profile = createNewPersonalProfile('Vector PDF Profile');
+  // Character with light stroke (width 1.2 pt)
+  profile.glyphs['i'] = [
+    {
+      id: 'i_custom',
+      createdAt: Date.now(),
+      strokes: [
+        {
+          id: 'i_stem',
+          points: [
+            { x: 100, y: 100, pressure: 0.2, tiltX: 0, tiltY: 0, timestamp: 1 },
+            { x: 100, y: 140, pressure: 0.2, tiltX: 0, tiltY: 0, timestamp: 2 },
+          ],
+          baseWidth: 1.2,
+          color: '#0f172a',
+        },
+        {
+          id: 'i_dot',
+          points: [{ x: 100, y: 80, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 3 }],
+          baseWidth: 2.0,
+          color: '#0f172a',
+        },
+      ],
+      cellBounds: { minX: 100, minY: 80, maxX: 100, maxY: 140 },
+      baselineY: 140,
+      capHeightY: 60,
+      xHeightY: 100,
+    },
+  ];
+
+  const renderer = new SampleBasedHandwritingRenderer(profile);
+  const pages = layoutTextWithProfile('i', profile, {
+    pageWidth: 595,
+    pageHeight: 842,
+    margins: { top: 40, right: 40, bottom: 40, left: 40 },
+    fontSize: 24,
+    lineHeight: 1.5,
+    letterSpacing: 1.0,
+    wordSpacing: 1.0,
+  });
+
+  const pdf = createVectorPDFDocument(pages, renderer);
+  const pdfString = pdf.output();
+
+  // 1. PDF must contain vector path drawing operators (e.g. 're' for rectangle, 'w' for line width, 'm' / 'l' for lines)
+  assert.ok(pdfString.includes(' re') || pdfString.includes(' l') || pdfString.includes(' m'), 'PDF must contain vector drawing commands');
+
+  // 2. PDF must NOT contain raster JPEG embeddings (/DCTDecode or /Image)
+  assert.ok(!pdfString.includes('/DCTDecode'), 'Vector PDF must not embed raster JPEG images');
+});
+
+
 

@@ -12,7 +12,6 @@ export function createStarterSample(char: string): CharacterSample {
   const capHeightY = 60;
   const xHeightY = 96;
 
-  // Generate basic stroke geometry matching character structure
   const strokes: RawSampleStroke[] = [];
   const color = '#0f172a';
   const baseWidth = 2.4;
@@ -27,11 +26,10 @@ export function createStarterSample(char: string): CharacterSample {
       pressure: 0.5 + Math.sin(idx / 3) * 0.15,
       tiltX: 0,
       tiltY: 0,
-      timestamp: Date.now() + idx * 10,
+      timestamp: 1000 + idx * 10,
     })),
   });
 
-  // Basic print paths for starter profile
   if (char === 'a') {
     strokes.push(
       makeStroke('a_circle', [
@@ -181,20 +179,17 @@ export function createStarterSample(char: string): CharacterSample {
   } else if (char === "'") {
     strokes.push(makeStroke('quote', [[100, 60], [98, 72]]));
   } else if (char >= 'A' && char <= 'Z') {
-    // Basic uppercase fallback geometry
     strokes.push(
       makeStroke('cap_v1', [[80, 60], [80, 140]]),
       makeStroke('cap_v2', [[80, 60], [120, 100], [80, 140]])
     );
   } else if (char >= '0' && char <= '9') {
-    // Basic digit fallback geometry
     strokes.push(
       makeStroke('digit_loop', [
         [100, 60], [75, 85], [75, 115], [100, 140], [125, 115], [125, 85], [100, 60],
       ])
     );
   } else {
-    // Generic fallback stroke
     strokes.push(makeStroke('generic', [[80, 100], [120, 100]]));
   }
 
@@ -213,13 +208,53 @@ export function createStarterSample(char: string): CharacterSample {
 
   return {
     id: `sample_${char}_starter`,
-    createdAt: Date.now(),
+    createdAt: 1700000000000,
     strokes,
     cellBounds: { minX, minY, maxX, maxY },
     baselineY,
     capHeightY,
     xHeightY,
+    isStarter: true,
+    provenance: 'synthetic_starter',
   };
+}
+
+const canonicalCache: Record<string, CharacterSample> = {};
+
+export function getCanonicalStarterSample(char: string): CharacterSample {
+  if (!canonicalCache[char]) {
+    canonicalCache[char] = createStarterSample(char);
+  }
+  return canonicalCache[char];
+}
+
+/**
+ * Checks whether a given sample has untouched synthetic starter geometry.
+ * Returns true ONLY if all stroke points match the canonical starter geometry exactly.
+ */
+export function isUntouchedStarterSample(sample: CharacterSample, char: string): boolean {
+  if (!sample || !sample.strokes) return false;
+  const canonical = getCanonicalStarterSample(char);
+  if (!canonical || !canonical.strokes) return false;
+
+  if (sample.strokes.length !== canonical.strokes.length) return false;
+
+  for (let s = 0; s < canonical.strokes.length; s++) {
+    const cs = canonical.strokes[s];
+    const ss = sample.strokes[s];
+    if (!ss || !Array.isArray(ss.points) || ss.points.length !== cs.points.length) {
+      return false;
+    }
+    for (let p = 0; p < cs.points.length; p++) {
+      const cp = cs.points[p];
+      const sp = ss.points[p];
+      if (!sp || Math.abs(sp.x - cp.x) > 0.001 || Math.abs(sp.y - cp.y) > 0.001) {
+        return false;
+      }
+    }
+  }
+
+  return true;
 }
 
 export function populateStarterAlphabet(): Record<string, CharacterSample[]> {

@@ -257,9 +257,12 @@ export const CaptureCell: React.FC<CaptureCellProps> = ({
       maxY = baselineY;
     }
 
+    const existingSample = samples[activeSampleIndex];
+    // If the sample being edited was a starter sample, assign a new user sample ID
     const currentSampleId =
-      samples[activeSampleIndex]?.id ||
-      `sample_${char}_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`;
+      existingSample && !existingSample.id.endsWith('_starter') && !existingSample.isStarter
+        ? existingSample.id
+        : `sample_user_${char}_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`;
 
     const newSample: CharacterSample = {
       id: currentSampleId,
@@ -269,6 +272,8 @@ export const CaptureCell: React.FC<CaptureCellProps> = ({
       baselineY,
       capHeightY,
       xHeightY,
+      isStarter: false,
+      provenance: existingSample ? 'user_edited' : 'user_captured',
     };
 
     onSaveSample(newSample);
