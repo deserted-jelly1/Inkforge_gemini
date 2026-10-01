@@ -1,6 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { HandwritingProfile } from '../../handwriting/types';
 import { isStarterSample } from '../../handwriting/profileStorage';
+import { FailedProfileOp } from './HandwritingLab';
 import {
   Download,
   Upload,
@@ -10,11 +11,13 @@ import {
   Check,
   ShieldCheck,
   Sparkles,
+  AlertTriangle,
 } from 'lucide-react';
 
 interface ProfileManagerProps {
   profiles: HandwritingProfile[];
   activeProfile: HandwritingProfile | null;
+  failedProfileOps?: Record<string, FailedProfileOp>;
   onSelectProfile: (id: string) => void;
   onCreateProfile: (name: string) => void;
   onRenameProfile: (id: string, newName: string) => void;
@@ -26,6 +29,7 @@ interface ProfileManagerProps {
 export const ProfileManager: React.FC<ProfileManagerProps> = ({
   profiles,
   activeProfile,
+  failedProfileOps = {},
   onSelectProfile,
   onCreateProfile,
   onRenameProfile,
@@ -95,12 +99,35 @@ export const ProfileManager: React.FC<ProfileManagerProps> = ({
                   onChange={(e) => onSelectProfile(e.target.value)}
                   className="font-semibold text-neutral-900 bg-neutral-100 hover:bg-neutral-200 border-0 rounded px-2 py-1 cursor-pointer focus:outline-none"
                 >
-                  {profiles.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name} {p.isDemo ? '(Demo Template)' : ''}
-                    </option>
-                  ))}
+                  {profiles.map((p) => {
+                    const hasFailed = Boolean(
+                      failedProfileOps[p.id] ||
+                        failedProfileOps[`create_${p.id}`] ||
+                        failedProfileOps[`import_${p.id}`]
+                    );
+                    return (
+                      <option key={p.id} value={p.id}>
+                        {hasFailed ? '⚠️ ' : ''}
+                        {p.name} {p.isDemo ? '(Demo Template)' : ''}
+                        {hasFailed ? ' [Unsaved Error]' : ''}
+                      </option>
+                    );
+                  })}
                 </select>
+
+                {Boolean(
+                  failedProfileOps[activeProfile.id] ||
+                    failedProfileOps[`create_${activeProfile.id}`] ||
+                    failedProfileOps[`import_${activeProfile.id}`]
+                ) && (
+                  <span
+                    className="flex items-center gap-1 text-[10px] text-rose-700 bg-rose-50 border border-rose-200 px-1.5 py-0.5 rounded font-medium"
+                    title="This profile has an unsaved snapshot that failed to write to storage"
+                  >
+                    <AlertTriangle className="w-3 h-3 text-rose-600 shrink-0" />
+                    <span>Unsaved Changes</span>
+                  </span>
+                )}
 
                 {!activeProfile.isDemo && (
                   <button

@@ -189,62 +189,88 @@ export function migrateProfile(profile: HandwritingProfile): {
 
 /**
  * Loads all profiles from IndexedDB with failure / empty separation.
+ * Transactional: Returns migrated profiles only after transaction.oncomplete commits.
+ * Atomic: Both profile mutation and pre-migration backup commit together or roll back on abort.
  */
 export async function listProfiles(): Promise<LoadProfilesResult> {
   try {
     const db = await openProfilesDatabase();
     return new Promise((resolve) => {
+      let resolved = false;
+      const safeResolve = (res: LoadProfilesResult) => {
+        if (!resolved) {
+          resolved = true;
+          resolve(res);
+        }
+      };
+
       try {
         const tx = db.transaction([PROFILES_STORE, BACKUP_STORE], 'readwrite');
         const store = tx.objectStore(PROFILES_STORE);
         const backupStore = tx.objectStore(BACKUP_STORE);
         const req = store.getAll();
 
-        req.onsuccess = () => {
-          const rawProfiles = (req.result as HandwritingProfile[]) || [];
-          if (rawProfiles.length === 0) {
-            resolve({ status: 'empty' });
-            return;
-          }
+        const migratedList: HandwritingProfile[] = [];
 
-          const migratedList: HandwritingProfile[] = [];
+        // Attach transaction lifecycle handlers upfront
+        tx.oncomplete = () => {
+          safeResolve({ status: 'found', profiles: migratedList });
+        };
 
-          for (const p of rawProfiles) {
-            const { profile: cleanP, migrated, backupToSave } = migrateProfile(p);
-            migratedList.push(cleanP);
-            if (migrated) {
-              store.put(cleanP);
-              if (backupToSave) {
-                backupStore.put(backupToSave);
-              }
-            }
-          }
+        tx.onerror = () => {
+          safeResolve({
+            status: 'error',
+            error: tx.error?.message || 'Transaction failed reading/migrating profiles.',
+          });
+        };
 
-          resolve({ status: 'found', profiles: migratedList });
+        tx.onabort = () => {
+          safeResolve({
+            status: 'error',
+            error: 'Transaction aborted while reading/migrating profiles.',
+          });
         };
 
         req.onerror = () => {
-          resolve({
+          safeResolve({
             status: 'error',
             error: req.error?.message || 'Failed reading profiles store.',
           });
         };
 
-        tx.onerror = () => {
-          resolve({
-            status: 'error',
-            error: tx.error?.message || 'Transaction failed reading profiles.',
-          });
-        };
+        req.onsuccess = () => {
+          try {
+            const rawProfiles = (req.result as HandwritingProfile[]) || [];
+            if (rawProfiles.length === 0) {
+              safeResolve({ status: 'empty' });
+              return;
+            }
 
-        tx.onabort = () => {
-          resolve({
-            status: 'error',
-            error: 'Transaction aborted while reading profiles.',
-          });
+            for (const p of rawProfiles) {
+              try {
+                const { profile: cleanP, migrated, backupToSave } = migrateProfile(p);
+                migratedList.push(cleanP);
+                if (migrated) {
+                  store.put(cleanP);
+                  if (backupToSave) {
+                    backupStore.put(backupToSave);
+                  }
+                }
+              } catch (migErr) {
+                console.error('Error migrating individual profile:', migErr);
+                // Preserve malformed or ambiguous original data for recovery rather than discarding
+                migratedList.push(p);
+              }
+            }
+          } catch (innerErr: any) {
+            safeResolve({
+              status: 'error',
+              error: innerErr?.message || 'Error processing loaded profiles.',
+            });
+          }
         };
       } catch (err: any) {
-        resolve({
+        safeResolve({
           status: 'error',
           error: err?.message || 'Failed opening readwrite profiles transaction.',
         });
@@ -289,8 +315,9 @@ export async function saveProfile(profile: HandwritingProfile): Promise<void> {
     try {
       const tx = db.transaction(PROFILES_STORE, 'readwrite');
       const store = tx.objectStore(PROFILES_STORE);
-      store.put(profile);
+      const req = store.put(profile);
 
+      req.onerror = () => reject(req.error || new Error('Profile put request failed.'));
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error || new Error('Failed saving profile.'));
       tx.onabort = () => reject(new Error('Profile transaction aborted.'));
@@ -306,8 +333,9 @@ export async function deleteProfile(id: string): Promise<void> {
     try {
       const tx = db.transaction(PROFILES_STORE, 'readwrite');
       const store = tx.objectStore(PROFILES_STORE);
-      store.delete(id);
+      const req = store.delete(id);
 
+      req.onerror = () => reject(req.error || new Error('Profile delete request failed.'));
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error || new Error('Failed deleting profile.'));
       tx.onabort = () => reject(new Error('Profile deletion aborted.'));

@@ -942,9 +942,19 @@ test('27. Migration Idempotence: Running migration repeatedly produces identical
 // -------------------------------------------------------------
 // 15. Draft Read-Error Handling & Zero-Write Invariant
 // -------------------------------------------------------------
-test('28. Draft Error Handling: Read failure preserves storage and performs ZERO writes', async () => {
-  const { getOrLoadActiveDraft } = await import('../handwriting/draftManager.ts');
+test('28. Draft Error Handling: Read failure preserves storage, locks mutations, and performs ZERO writes', async () => {
+  const {
+    getOrLoadActiveDraft,
+    updateDraft,
+    setDraftProfileId,
+    flushDraftSave,
+    getDraftManagerState,
+    resetDraftManagerForTesting,
+  } = await import('../handwriting/draftManager.ts');
+  const { closeProfilesDatabase } = await import('../handwriting/profileStorage.ts');
 
+  closeProfilesDatabase();
+  resetDraftManagerForTesting();
   const originalIndexedDB = globalThis.indexedDB;
   let writeAttempted = false;
 
@@ -953,16 +963,18 @@ test('28. Draft Error Handling: Read failure preserves storage and performs ZERO
       open: () => {
         const req: any = {};
         setTimeout(() => {
-          // Open succeeds but transaction fails
           const fakeDB: any = {
             transaction: () => {
               const tx: any = {
+                oncomplete: null,
+                onerror: null,
                 objectStore: () => ({
                   get: () => {
                     const getReq: any = {};
                     setTimeout(() => {
                       getReq.error = new Error('Simulated QuotaExceededError or DB locked on read');
                       if (getReq.onerror) getReq.onerror();
+                      if (tx.onerror) tx.onerror();
                     }, 5);
                     return getReq;
                   },
@@ -983,53 +995,161 @@ test('28. Draft Error Handling: Read failure preserves storage and performs ZERO
       },
     };
 
+    // 1. Initial load fails
     const res = await getOrLoadActiveDraft('test_profile');
     assert.equal(res.status, 'error', 'Read failure must return error status');
-    assert.equal(writeAttempted, false, 'Draft read failure must cause ZERO default-draft writes');
+    assert.equal(getDraftManagerState(), 'load_error', 'Manager state must be load_error');
+
+    // 2. Editing must be rejected in the manager
+    const editAllowed = updateDraft({
+      schemaVersion: 1,
+      id: 'composer_draft_active',
+      title: 'Overwriting draft',
+      text: 'Sneaky edit while unread',
+      profileId: 'test_profile',
+      options: {
+        pageWidth: 595,
+        pageHeight: 842,
+        margins: { top: 48, right: 48, bottom: 48, left: 48 },
+        fontSize: 24,
+        lineHeight: 1.5,
+        letterSpacing: 1.0,
+        wordSpacing: 1.0,
+      },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    assert.equal(editAllowed, false, 'Mutations must be rejected when draft is in load_error state');
+
+    // 3. Profile switching must not overwrite unread draft
+    const profileSwitchAllowed = setDraftProfileId('another_profile');
+    assert.equal(profileSwitchAllowed, false, 'Profile patching must be rejected in load_error state');
+
+    // 4. Component unmount flush must not write anything
+    await flushDraftSave();
+
+    // 5. Total writes must be strictly zero
+    assert.equal(writeAttempted, false, 'Draft read failure must cause ZERO writes across all operations');
   } finally {
     (globalThis as any).indexedDB = originalIndexedDB;
+    closeProfilesDatabase();
+    resetDraftManagerForTesting();
   }
 });
 
 // -------------------------------------------------------------
-// 16. Draft Navigation Safety & Debounce Flush
+// 16. Draft Navigation Safety & Realistic Storage Persistence
 // -------------------------------------------------------------
-test('29. Draft Manager: Flushes edits immediately and prevents stale callbacks from replacing newer revisions', async () => {
-  const { updateDraft, flushDraftSave, getCurrentDraft, getDraftStatus } = await import(
-    '../handwriting/draftManager.ts'
-  );
+test('29. Draft Manager: Flushes edits to storage on navigation, survives reload, and ignores stale callbacks', async () => {
+  const {
+    getOrLoadActiveDraft,
+    updateDraft,
+    flushDraftSave,
+    getCurrentDraft,
+    resetDraftManagerForTesting,
+  } = await import('../handwriting/draftManager.ts');
+  const { closeProfilesDatabase } = await import('../handwriting/profileStorage.ts');
 
-  const baseDraft = {
-    schemaVersion: 1 as const,
-    id: 'composer_draft_active',
-    title: 'Midterm Notes',
-    text: 'Version 1 text',
-    profileId: 'prof_1',
-    options: {
-      pageWidth: 595,
-      pageHeight: 842,
-      margins: { top: 40, right: 40, bottom: 40, left: 40 },
-      fontSize: 24,
-      lineHeight: 1.5,
-      letterSpacing: 1.0,
-      wordSpacing: 1.0,
-    },
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  };
+  closeProfilesDatabase();
+  resetDraftManagerForTesting();
+  const originalIndexedDB = globalThis.indexedDB;
 
-  // 1. Edit draft
-  updateDraft({ ...baseDraft, text: 'Version 2: Unique paragraph before tab switch' });
-  const activeInMemory = getCurrentDraft();
-  assert.equal(activeInMemory?.text, 'Version 2: Unique paragraph before tab switch');
+  // Realistic mock storage simulating IndexedDB 'drafts' store
+  const storageMap = new Map<string, any>();
 
-  // 2. Immediate flush simulating user navigating away from tab
-  await flushDraftSave();
+  try {
+    (globalThis as any).indexedDB = {
+      open: () => {
+        const req: any = {};
+        setTimeout(() => {
+          const fakeDB: any = {
+            transaction: (_stores: any, _mode: string) => {
+              const tx: any = {
+                oncomplete: null,
+                onerror: null,
+                objectStore: () => ({
+                  get: (key: string) => {
+                    const getReq: any = {};
+                    setTimeout(() => {
+                      getReq.result = storageMap.get(key);
+                      if (getReq.onsuccess) getReq.onsuccess();
+                    }, 5);
+                    return getReq;
+                  },
+                  put: (val: any, key: string) => {
+                    const putReq: any = {};
+                    setTimeout(() => {
+                      storageMap.set(key, JSON.parse(JSON.stringify(val)));
+                      if (putReq.onsuccess) putReq.onsuccess();
+                      if (tx.oncomplete) tx.oncomplete();
+                    }, 5);
+                    return putReq;
+                  },
+                }),
+              };
+              return tx;
+            },
+            close: () => {},
+          };
+          req.result = fakeDB;
+          if (req.onsuccess) req.onsuccess();
+        }, 5);
+        return req;
+      },
+    };
 
-  // 3. Edit again simulating rapid return
-  updateDraft({ ...baseDraft, text: 'Version 3: Newest edit after rapid return' });
-  const finalInMemory = getCurrentDraft();
-  assert.equal(finalInMemory?.text, 'Version 3: Newest edit after rapid return');
+    // 1. Initial load (not_found -> seeds initial draft)
+    const initRes = await getOrLoadActiveDraft('prof_1');
+    assert.ok(initRes.draft, 'Seeded draft should exist');
+    await flushDraftSave();
+
+    // Verify storage has initial draft
+    assert.ok(storageMap.has('active_composer_draft'));
+
+    // 2. User edits draft with unique text
+    const active = getCurrentDraft()!;
+    updateDraft({
+      ...active,
+      text: 'Unique paragraph before leaving tab',
+      options: { ...active.options, fontSize: 32 },
+    });
+
+    // 3. User immediately navigates away from tab (triggers flushDraftSave)
+    await flushDraftSave();
+
+    // Verify storage was committed
+    assert.equal(
+      storageMap.get('active_composer_draft')?.text,
+      'Unique paragraph before leaving tab'
+    );
+    assert.equal(
+      storageMap.get('active_composer_draft')?.options?.fontSize,
+      32
+    );
+
+    // 4. User immediately returns, edits again
+    const active2 = getCurrentDraft()!;
+    updateDraft({
+      ...active2,
+      text: 'Newest edit after returning to tab',
+      options: { ...active2.options, fontSize: 36 },
+    });
+    await flushDraftSave();
+
+    // 5. Recreate session completely (simulating browser reload)
+    closeProfilesDatabase();
+    resetDraftManagerForTesting();
+
+    // Load from storage after reload
+    const reloaded = await getOrLoadActiveDraft('prof_1');
+    assert.equal(reloaded.status, 'found');
+    assert.equal(reloaded.draft?.text, 'Newest edit after returning to tab');
+    assert.equal(reloaded.draft?.options?.fontSize, 36);
+  } finally {
+    (globalThis as any).indexedDB = originalIndexedDB;
+    closeProfilesDatabase();
+    resetDraftManagerForTesting();
+  }
 });
 
 // -------------------------------------------------------------
@@ -1092,6 +1212,437 @@ test('30. Vector PDF: Generates genuine vector content with un-clamped dynamic w
   // 2. PDF must NOT contain raster JPEG embeddings (/DCTDecode or /Image)
   assert.ok(!pdfString.includes('/DCTDecode'), 'Vector PDF must not embed raster JPEG images');
 });
+
+// -------------------------------------------------------------
+// 18. Draft Retry Restoration
+// -------------------------------------------------------------
+test('31. Draft Retry: Successful retry restores original saved draft after initial read error', async () => {
+  const {
+    getOrLoadActiveDraft,
+    retryDraftLoad,
+    getCurrentDraft,
+    getDraftManagerState,
+    resetDraftManagerForTesting,
+  } = await import('../handwriting/draftManager.ts');
+  const { closeProfilesDatabase } = await import('../handwriting/profileStorage.ts');
+
+  closeProfilesDatabase();
+  resetDraftManagerForTesting();
+  const originalIndexedDB = globalThis.indexedDB;
+  let simulateReadFailure = true;
+
+  const savedDocument = {
+    schemaVersion: 1 as const,
+    id: 'composer_draft_active',
+    title: 'Genuine Saved Draft',
+    text: 'Important research notes that must not be lost.',
+    profileId: 'prof_alice',
+    options: {
+      pageWidth: 595,
+      pageHeight: 842,
+      margins: { top: 48, right: 48, bottom: 48, left: 48 },
+      fontSize: 26,
+      lineHeight: 1.6,
+      letterSpacing: 1.0,
+      wordSpacing: 1.0,
+    },
+    createdAt: 1700000000000,
+    updatedAt: 1700000001000,
+    revision: 5,
+  };
+
+  try {
+    (globalThis as any).indexedDB = {
+      open: () => {
+        const req: any = {};
+        setTimeout(() => {
+          const fakeDB: any = {
+            transaction: () => {
+              const tx: any = {
+                oncomplete: null,
+                onerror: null,
+                objectStore: () => ({
+                  get: () => {
+                    const getReq: any = {};
+                    setTimeout(() => {
+                      if (simulateReadFailure) {
+                        getReq.error = new Error('Transient I/O failure or database locked');
+                        if (getReq.onerror) getReq.onerror();
+                        if (tx.onerror) tx.onerror();
+                      } else {
+                        getReq.result = savedDocument;
+                        if (getReq.onsuccess) getReq.onsuccess();
+                        if (tx.oncomplete) tx.oncomplete();
+                      }
+                    }, 5);
+                    return getReq;
+                  },
+                }),
+              };
+              return tx;
+            },
+            close: () => {},
+          };
+          req.result = fakeDB;
+          if (req.onsuccess) req.onsuccess();
+        }, 5);
+        return req;
+      },
+    };
+
+    // 1. Initial read fails
+    const failRes = await getOrLoadActiveDraft('prof_alice');
+    assert.equal(failRes.status, 'error');
+    assert.equal(getDraftManagerState(), 'load_error');
+    assert.equal(getCurrentDraft(), null, 'No draft in memory during load error');
+
+    // 2. Storage recovers
+    simulateReadFailure = false;
+
+    // 3. User clicks Retry
+    const retryRes = await retryDraftLoad('prof_alice');
+    assert.equal(retryRes.status, 'found');
+    assert.equal(getDraftManagerState(), 'ready');
+    assert.equal(retryRes.draft?.text, 'Important research notes that must not be lost.');
+    assert.equal(getCurrentDraft()?.title, 'Genuine Saved Draft');
+  } finally {
+    (globalThis as any).indexedDB = originalIndexedDB;
+    closeProfilesDatabase();
+    resetDraftManagerForTesting();
+  }
+});
+
+// -------------------------------------------------------------
+// 19. Initial Save Failure Never Shows Saved Indicator
+// -------------------------------------------------------------
+test('32. Draft Initial Save Failure: Never produces saved indicator and retains draft in memory', async () => {
+  const {
+    getOrLoadActiveDraft,
+    getCurrentDraft,
+    getDraftStatus,
+    retryDraftSave,
+    resetDraftManagerForTesting,
+  } = await import('../handwriting/draftManager.ts');
+  const { closeProfilesDatabase } = await import('../handwriting/profileStorage.ts');
+
+  closeProfilesDatabase();
+  resetDraftManagerForTesting();
+  const originalIndexedDB = globalThis.indexedDB;
+  let simulateSaveFailure = true;
+
+  try {
+    (globalThis as any).indexedDB = {
+      open: () => {
+        const req: any = {};
+        setTimeout(() => {
+          const fakeDB: any = {
+            transaction: () => {
+              const tx: any = {
+                oncomplete: null,
+                onerror: null,
+                objectStore: () => ({
+                  get: () => {
+                    const getReq: any = {};
+                    setTimeout(() => {
+                      // Confirmed not_found
+                      getReq.result = undefined;
+                      if (getReq.onsuccess) getReq.onsuccess();
+                    }, 5);
+                    return getReq;
+                  },
+                  put: () => {
+                    const putReq: any = {};
+                    setTimeout(() => {
+                      if (simulateSaveFailure) {
+                        putReq.error = new Error('Disk quota exceeded on initial save');
+                        if (putReq.onerror) putReq.onerror();
+                        tx.error = putReq.error;
+                        if (tx.onerror) tx.onerror();
+                      } else {
+                        if (putReq.onsuccess) putReq.onsuccess();
+                        if (tx.oncomplete) tx.oncomplete();
+                      }
+                    }, 5);
+                    return putReq;
+                  },
+                }),
+              };
+              return tx;
+            },
+            close: () => {},
+          };
+          req.result = fakeDB;
+          if (req.onsuccess) req.onsuccess();
+        }, 5);
+        return req;
+      },
+    };
+
+    // 1. Load confirms not_found, creates seeded draft, but initial save fails
+    const res = await getOrLoadActiveDraft('prof_init');
+    assert.equal(res.status, 'not_found');
+
+    // 2. Draft status must be 'error', NEVER 'idle' (saved)
+    assert.equal(getDraftStatus(), 'error', 'Initial save failure must produce error status, never idle');
+
+    // 3. Draft must be retained in memory for recovery
+    const inMem = getCurrentDraft();
+    assert.ok(inMem, 'New draft must be retained in memory despite save failure');
+
+    // 4. Retry when storage recovers
+    simulateSaveFailure = false;
+    const retrySuccess = await retryDraftSave();
+    assert.equal(retrySuccess, true);
+    assert.equal(getDraftStatus(), 'idle', 'Successful save after retry updates status to idle');
+  } finally {
+    (globalThis as any).indexedDB = originalIndexedDB;
+    closeProfilesDatabase();
+    resetDraftManagerForTesting();
+  }
+});
+
+// -------------------------------------------------------------
+// 20. Transactional Migration Rollback
+// -------------------------------------------------------------
+test('33. Transactional Migration: Backup/write failure rolls back both stores and returns error', async () => {
+  const { listProfiles, closeProfilesDatabase } = await import('../handwriting/profileStorage.ts');
+  const { createStarterSample } = await import('../handwriting/defaultGlyphs.ts');
+
+  closeProfilesDatabase();
+  const originalIndexedDB = globalThis.indexedDB;
+
+  const profileNeedingMigration = {
+    schemaVersion: 1 as const,
+    app: 'InkForge-HandwritingProfile' as const,
+    id: 'prof_needs_mig',
+    name: 'Unmigrated Profile',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    isDemo: false,
+    glyphs: {
+      a: [createStarterSample('a')], // untouched starter to remove
+    },
+  };
+
+  try {
+    (globalThis as any).indexedDB = {
+      open: () => {
+        const req: any = {};
+        setTimeout(() => {
+          const fakeDB: any = {
+            transaction: () => {
+              const tx: any = {
+                oncomplete: null,
+                onerror: null,
+                onabort: null,
+                objectStore: () => ({
+                  getAll: () => {
+                    const getReq: any = {};
+                    setTimeout(() => {
+                      getReq.result = [profileNeedingMigration];
+                      if (getReq.onsuccess) getReq.onsuccess();
+                    }, 5);
+                    return getReq;
+                  },
+                  put: () => {
+                    // Simulate an abort / failure during the migration transaction
+                    setTimeout(() => {
+                      tx.error = new Error('Disk error during atomic migration transaction');
+                      if (tx.onerror) tx.onerror();
+                    }, 5);
+                  },
+                }),
+              };
+              return tx;
+            },
+            close: () => {},
+          };
+          req.result = fakeDB;
+          if (req.onsuccess) req.onsuccess();
+        }, 5);
+        return req;
+      },
+    };
+
+    const res = await listProfiles();
+    assert.equal(res.status, 'error', 'Migration transaction failure must return error status, never found');
+    if (res.status === 'error') {
+      assert.ok(res.error.includes('Disk error'));
+    }
+  } finally {
+    (globalThis as any).indexedDB = originalIndexedDB;
+    closeProfilesDatabase();
+  }
+});
+
+// -------------------------------------------------------------
+// 21. Profile Isolation & Identity-Based Failure Tracking
+// -------------------------------------------------------------
+test('34. Profile Isolation: Failed save of profile A remains recoverable after selecting profile B', async () => {
+  const { createNewPersonalProfile, saveProfile, closeProfilesDatabase } = await import(
+    '../handwriting/profileStorage.ts'
+  );
+
+  closeProfilesDatabase();
+  const originalIndexedDB = globalThis.indexedDB;
+
+  // Track which profile IDs fail
+  const failingProfileIds = new Set<string>(['profile_A']);
+  const committedProfiles = new Map<string, any>();
+
+  try {
+    (globalThis as any).indexedDB = {
+      open: () => {
+        const req: any = {};
+        setTimeout(() => {
+          const fakeDB: any = {
+            transaction: () => {
+              const tx: any = {
+                oncomplete: null,
+                onerror: null,
+                objectStore: () => ({
+                  put: (val: any) => {
+                    const putReq: any = {};
+                    setTimeout(() => {
+                      if (failingProfileIds.has(val.id)) {
+                        tx.error = new Error(`Disk error saving profile ${val.name}`);
+                        if (tx.onerror) tx.onerror();
+                      } else {
+                        committedProfiles.set(val.id, val);
+                        if (tx.oncomplete) tx.oncomplete();
+                      }
+                    }, 5);
+                    return putReq;
+                  },
+                }),
+              };
+              return tx;
+            },
+            close: () => {},
+          };
+          req.result = fakeDB;
+          if (req.onsuccess) req.onsuccess();
+        }, 5);
+        return req;
+      },
+    };
+
+    const profileA = createNewPersonalProfile('Alice Profile');
+    profileA.id = 'profile_A';
+    profileA.description = 'Alice unsaved custom draft';
+
+    const profileB = createNewPersonalProfile('Bob Profile');
+    profileB.id = 'profile_B';
+
+    // 1. Profile A save fails
+    let profileAError: string | null = null;
+    try {
+      await saveProfile(profileA);
+    } catch (err: any) {
+      profileAError = err.message;
+    }
+    assert.ok(profileAError?.includes('Alice Profile'));
+
+    // 2. User switches to Profile B and saves B successfully
+    await saveProfile(profileB);
+    assert.ok(committedProfiles.has('profile_B'), 'Profile B committed successfully');
+    assert.ok(!committedProfiles.has('profile_A'), 'Profile A was not committed');
+
+    // 3. User resolves issue and retries Profile A
+    failingProfileIds.delete('profile_A');
+    await saveProfile(profileA);
+    assert.ok(committedProfiles.has('profile_A'), 'Profile A recovered and committed');
+    assert.equal(committedProfiles.get('profile_A')?.description, 'Alice unsaved custom draft');
+  } finally {
+    (globalThis as any).indexedDB = originalIndexedDB;
+    closeProfilesDatabase();
+  }
+});
+
+// -------------------------------------------------------------
+// 22. Concurrent Initialization Deduplication
+// -------------------------------------------------------------
+test('35. Concurrent Initialization: Deduplicates requests and does not seed competing drafts', async () => {
+  const { getOrLoadActiveDraft, resetDraftManagerForTesting } = await import(
+    '../handwriting/draftManager.ts'
+  );
+  const { closeProfilesDatabase } = await import('../handwriting/profileStorage.ts');
+
+  closeProfilesDatabase();
+  resetDraftManagerForTesting();
+  const originalIndexedDB = globalThis.indexedDB;
+  let openCount = 0;
+
+  try {
+    (globalThis as any).indexedDB = {
+      open: () => {
+        openCount++;
+        const req: any = {};
+        setTimeout(() => {
+          const fakeDB: any = {
+            transaction: () => {
+              const tx: any = {
+                oncomplete: null,
+                onerror: null,
+                objectStore: () => ({
+                  get: () => {
+                    const getReq: any = {};
+                    setTimeout(() => {
+                      getReq.result = undefined; // not_found
+                      if (getReq.onsuccess) getReq.onsuccess();
+                    }, 10);
+                    return getReq;
+                  },
+                  put: () => {
+                    const putReq: any = {};
+                    setTimeout(() => {
+                      if (putReq.onsuccess) putReq.onsuccess();
+                      if (tx.oncomplete) tx.oncomplete();
+                    }, 10);
+                    return putReq;
+                  },
+                }),
+              };
+              return tx;
+            },
+            close: () => {},
+          };
+          req.result = fakeDB;
+          if (req.onsuccess) req.onsuccess();
+        }, 10);
+        return req;
+      },
+    };
+
+    // Spawn 5 concurrent initialization requests simultaneously
+    const results = await Promise.all([
+      getOrLoadActiveDraft('prof_concurrent'),
+      getOrLoadActiveDraft('prof_concurrent'),
+      getOrLoadActiveDraft('prof_concurrent'),
+      getOrLoadActiveDraft('prof_concurrent'),
+      getOrLoadActiveDraft('prof_concurrent'),
+    ]);
+
+    // All 5 must resolve to the identical draft object instance
+    const firstDraft = results[0].draft;
+    assert.ok(firstDraft);
+    for (let i = 1; i < results.length; i++) {
+      assert.strictEqual(
+        results[i].draft,
+        firstDraft,
+        `Call #${i} must return the deduplicated draft instance`
+      );
+    }
+
+    // Only 1 DB transaction occurred, not 5 competing writes
+    assert.equal(openCount, 1, 'Concurrent calls must deduplicate into a single database open');
+  } finally {
+    (globalThis as any).indexedDB = originalIndexedDB;
+    closeProfilesDatabase();
+    resetDraftManagerForTesting();
+  }
+});
+
 
 
 

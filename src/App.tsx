@@ -43,9 +43,95 @@ export default function App() {
   const [highlighterWidth, setHighlighterWidth] = useState<number>(16.0);
   const [eraserRadius, setEraserRadius] = useState<number>(20);
 
-  // Sidebar and History Drawer state
-  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(false);
+  // Sidebar and History Drawer state with persistent preferences
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('inkforge_sidebar_collapsed') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('inkforge_sidebar_width');
+      const parsed = saved ? parseInt(saved, 10) : 260;
+      return Number.isFinite(parsed) && parsed >= 200 && parsed <= 420 ? parsed : 260;
+    } catch {
+      return 260;
+    }
+  });
+
+  const [isFocusMode, setIsFocusMode] = useState<boolean>(false);
   const [isHistoryOpen, setIsHistoryOpen] = useState<boolean>(false);
+
+  const handleToggleSidebar = useCallback(() => {
+    setIsSidebarCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('inkforge_sidebar_collapsed', String(next));
+      } catch {}
+      return next;
+    });
+  }, []);
+
+  const handleResizeSidebar = useCallback((newWidth: number) => {
+    const clamped = Math.max(200, Math.min(420, newWidth));
+    setSidebarWidth(clamped);
+    try {
+      localStorage.setItem('inkforge_sidebar_width', String(clamped));
+    } catch {}
+  }, []);
+
+  const handleToggleFocusMode = useCallback(() => {
+    setIsFocusMode((prev) => !prev);
+  }, []);
+
+  // Global Keyboard Shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Do not trigger tool shortcuts if user is typing in an input, textarea, or contentEditable
+      const target = e.target as HTMLElement;
+      const isInput =
+        target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable;
+
+      if (e.key === 'Escape') {
+        if (isFocusMode) {
+          setIsFocusMode(false);
+          e.preventDefault();
+        } else if (isHistoryOpen) {
+          setIsHistoryOpen(false);
+          e.preventDefault();
+        }
+        return;
+      }
+
+      if (isInput) return;
+
+      if (e.key === 'f' || e.key === 'F') {
+        setIsFocusMode((prev) => !prev);
+        e.preventDefault();
+      } else if (e.key === '[' || (e.ctrlKey && e.key === 'b')) {
+        handleToggleSidebar();
+        e.preventDefault();
+      } else if (e.key === 'p' || e.key === 'P') {
+        setActiveTool('pen');
+      } else if (e.key === 'h' || e.key === 'H') {
+        setActiveTool('highlighter');
+      } else if (e.key === 'e' || e.key === 'E') {
+        setActiveTool('eraser');
+      } else if (e.key === 't' || e.key === 'T') {
+        setActiveTool('text');
+      } else if (e.key === 'v' || e.key === 'V') {
+        setActiveTool('pan');
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isFocusMode, isHistoryOpen, handleToggleSidebar]);
 
   // Persistence and Error States
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
@@ -581,55 +667,66 @@ export default function App() {
         </div>
       )}
 
-      {/* 1. Ribbon Bar */}
-      <OneNoteRibbon
-        activeTool={activeTool}
-        setActiveTool={setActiveTool}
-        activeColor={activeColor}
-        setActiveColor={setActiveColor}
-        baseWidth={baseWidth}
-        setBaseWidth={setBaseWidth}
-        highlighterWidth={highlighterWidth}
-        setHighlighterWidth={setHighlighterWidth}
-        eraserRadius={eraserRadius}
-        setEraserRadius={setEraserRadius}
-        backgroundPattern={backgroundPattern}
-        setBackgroundPattern={handleChangePattern}
-        historyManager={currentHistoryManager}
-        onUndo={() => currentHistoryManager.undo(handleUpdateCurrentPage)}
-        onRedo={() => currentHistoryManager.redo(handleUpdateCurrentPage)}
-        onClearInk={handleClearInk}
-        onToggleHistory={() => setIsHistoryOpen(!isHistoryOpen)}
-        isHistoryOpen={isHistoryOpen}
-        activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        onInsertTextBox={handleInsertTextBox}
-        onExportPNG={() => exportPageAsPNG(activePage, notebook.title, setExportError)}
-        onExportPDF={() => exportPageAsPDF(activePage, notebook.title, setExportError)}
-        onExportJSON={handleExportJSON}
-        onImportJSON={handleImportJSON}
-        saveStatus={saveStatus}
-        onRetrySave={handleRetrySave}
-      />
+      {/* 1. Ribbon Bar (Hidden in Focus Mode) */}
+      {!isFocusMode && (
+        <OneNoteRibbon
+          activeTool={activeTool}
+          setActiveTool={setActiveTool}
+          activeColor={activeColor}
+          setActiveColor={setActiveColor}
+          baseWidth={baseWidth}
+          setBaseWidth={setBaseWidth}
+          highlighterWidth={highlighterWidth}
+          setHighlighterWidth={setHighlighterWidth}
+          eraserRadius={eraserRadius}
+          setEraserRadius={setEraserRadius}
+          backgroundPattern={backgroundPattern}
+          setBackgroundPattern={handleChangePattern}
+          historyManager={currentHistoryManager}
+          onUndo={() => currentHistoryManager.undo(handleUpdateCurrentPage)}
+          onRedo={() => currentHistoryManager.redo(handleUpdateCurrentPage)}
+          onClearInk={handleClearInk}
+          onToggleHistory={() => setIsHistoryOpen(!isHistoryOpen)}
+          isHistoryOpen={isHistoryOpen}
+          activeTab={activeTab}
+          setActiveTab={setActiveTab}
+          onInsertTextBox={handleInsertTextBox}
+          onExportPNG={() => exportPageAsPNG(activePage, notebook.title, setExportError)}
+          onExportPDF={() => exportPageAsPDF(activePage, notebook.title, setExportError)}
+          onExportJSON={handleExportJSON}
+          onImportJSON={handleImportJSON}
+          saveStatus={saveStatus}
+          onRetrySave={handleRetrySave}
+          isFocusMode={isFocusMode}
+          onToggleFocusMode={handleToggleFocusMode}
+          currentSectionTitle={activeSection.title}
+          currentSectionColor={activeSection.color}
+          currentPageTitle={activePage.title}
+        />
+      )}
 
       {/* 2. Workspace Body */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Navigation Sidebar */}
-        <OneNoteSidebar
-          notebook={notebook}
-          onSelectSection={handleSelectSection}
-          onSelectPage={handleSelectPage}
-          onAddSection={handleAddSection}
-          onRenameSection={handleRenameSection}
-          onChangeSectionColor={handleChangeSectionColor}
-          onDeleteSection={handleDeleteSection}
-          onAddPage={handleAddPage}
-          onDuplicatePage={handleDuplicatePage}
-          onDeletePage={handleDeletePage}
-          onRenameNotebook={handleRenameNotebook}
-          isCollapsed={isSidebarCollapsed}
-          onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
-        />
+        {/* Navigation Sidebar (Hidden in Focus Mode) */}
+        {!isFocusMode && (
+          <OneNoteSidebar
+            notebook={notebook}
+            onSelectSection={handleSelectSection}
+            onSelectPage={handleSelectPage}
+            onAddSection={handleAddSection}
+            onRenameSection={handleRenameSection}
+            onChangeSectionColor={handleChangeSectionColor}
+            onDeleteSection={handleDeleteSection}
+            onAddPage={handleAddPage}
+            onDuplicatePage={handleDuplicatePage}
+            onDeletePage={handleDeletePage}
+            onRenameNotebook={handleRenameNotebook}
+            isCollapsed={isSidebarCollapsed}
+            onToggleCollapse={handleToggleSidebar}
+            width={sidebarWidth}
+            onResize={handleResizeSidebar}
+          />
+        )}
 
         {/* Canvas Surface or Developer Area */}
         <div className="flex-1 flex overflow-hidden relative">
@@ -647,6 +744,8 @@ export default function App() {
               historyManager={currentHistoryManager}
               newNoteFocusId={newNoteFocusId}
               onClearNewNoteFocus={() => setNewNoteFocusId(null)}
+              isFocusMode={isFocusMode}
+              onToggleFocusMode={() => setIsFocusMode(false)}
             />
           )}
 

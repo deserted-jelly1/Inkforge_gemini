@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { ToolType, BackgroundPattern } from '../types/inkforge';
 import { PageHistoryManager } from '../utils/historyManager';
 import {
@@ -22,6 +22,10 @@ import {
   AlertTriangle,
   Code2,
   Sparkles,
+  Maximize2,
+  Minimize2,
+  MoreHorizontal,
+  ChevronDown,
 } from 'lucide-react';
 
 export type SaveStatus = 'idle' | 'saving' | 'error';
@@ -54,20 +58,26 @@ interface RibbonProps {
   onImportJSON: (file: File) => void;
   saveStatus: SaveStatus;
   onRetrySave: () => void;
+  isFocusMode?: boolean;
+  onToggleFocusMode?: () => void;
+  currentSectionTitle?: string;
+  currentSectionColor?: string;
+  currentPageTitle?: string;
 }
 
-const PEN_PRESETS = [
-  { name: 'Black Gel (0.5mm)', hex: '#0f172a', width: 2.2, type: 'pen' as ToolType },
-  { name: 'Navy Blue (0.5mm)', hex: '#1d4ed8', width: 2.2, type: 'pen' as ToolType },
-  { name: 'Crimson (0.5mm)', hex: '#dc2626', width: 2.2, type: 'pen' as ToolType },
-  { name: 'Emerald (0.5mm)', hex: '#15803d', width: 2.2, type: 'pen' as ToolType },
+const PEN_COLORS = [
+  { name: 'Pitch Black', hex: '#0f172a' },
+  { name: 'Navy Blue', hex: '#1d4ed8' },
+  { name: 'Crimson Red', hex: '#dc2626' },
+  { name: 'Forest Green', hex: '#15803d' },
+  { name: 'Slate Gray', hex: '#64748b' },
 ];
 
-const HIGHLIGHTER_PRESETS = [
-  { name: 'Yellow Highlighter', hex: '#facc15' },
-  { name: 'Violet Highlighter', hex: '#c084fc' },
-  { name: 'Emerald Highlighter', hex: '#4ade80' },
-  { name: 'Sky Blue Highlighter', hex: '#38bdf8' },
+const HIGHLIGHTER_COLORS = [
+  { name: 'Sunny Yellow', hex: '#fde047' },
+  { name: 'Lavender Purple', hex: '#c084fc' },
+  { name: 'Mint Green', hex: '#86efac' },
+  { name: 'Sky Blue', hex: '#7dd3fc' },
 ];
 
 export const OneNoteRibbon: React.FC<RibbonProps> = ({
@@ -98,10 +108,30 @@ export const OneNoteRibbon: React.FC<RibbonProps> = ({
   onImportJSON,
   saveStatus,
   onRetrySave,
+  isFocusMode = false,
+  onToggleFocusMode,
+  currentSectionTitle,
+  currentSectionColor = '#4f46e5',
+  currentPageTitle,
 }) => {
   const [showPatternPicker, setShowPatternPicker] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
+  const [showSecondaryMenu, setShowSecondaryMenu] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Close menus on click outside
+  useEffect(() => {
+    const handleGlobalClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest('.ribbon-menu-container')) {
+        setShowExportMenu(false);
+        setShowSecondaryMenu(false);
+        setShowPatternPicker(false);
+      }
+    };
+    window.addEventListener('click', handleGlobalClick);
+    return () => window.removeEventListener('click', handleGlobalClick);
+  }, []);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -111,63 +141,89 @@ export const OneNoteRibbon: React.FC<RibbonProps> = ({
     }
   };
 
+  const isNotebookWorkspace = activeTab === 'draw' || activeTab === 'home' || activeTab === 'view';
+
   return (
-    <header className="border-b border-neutral-200 bg-white flex flex-col shrink-0 select-none text-neutral-800 z-30">
-      {/* 1. Top Bar: App Title, Save Status, Undo/Redo, Tabs, Export */}
-      <div className="h-10 border-b border-neutral-200 px-3 flex items-center justify-between text-xs">
-        {/* Left: Brand & Persistence Status */}
-        <div className="flex items-center gap-2.5">
-          <div className="flex items-center gap-1.5 font-bold tracking-tight text-neutral-900">
-            <span className="w-5 h-5 rounded bg-indigo-600 text-white flex items-center justify-center text-xs font-mono shadow-xs">
+    <header className="border-b border-neutral-200/80 bg-white flex flex-col shrink-0 select-none text-neutral-800 z-30 font-sans">
+      {/* 1. Top Bar: Brand, Context, Save Status, Workspace Navigation, Actions */}
+      <div className="h-10 px-3 flex items-center justify-between text-xs border-b border-neutral-100">
+        {/* Left: Brand & Context */}
+        <div className="flex items-center gap-2.5 min-w-0">
+          {/* InkForge Logo */}
+          <div className="flex items-center gap-1.5 shrink-0">
+            <span className="w-5 h-5 rounded-md bg-indigo-600 text-white flex items-center justify-center text-[11px] font-mono font-bold shadow-2xs">
               IF
             </span>
-            <span className="text-sm">InkForge</span>
+            <span className="font-semibold text-neutral-900 tracking-tight text-xs hidden sm:inline">
+              InkForge
+            </span>
           </div>
 
-          <div className="h-3.5 w-px bg-neutral-200 mx-1" />
+          <div className="h-3.5 w-px bg-neutral-200/80 shrink-0" />
+
+          {/* Notebook Section & Page Context */}
+          {currentSectionTitle && (
+            <div className="flex items-center gap-1.5 text-xs text-neutral-600 truncate max-w-[200px] sm:max-w-[320px]">
+              <span
+                className="w-2 h-2 rounded-full shrink-0"
+                style={{ backgroundColor: currentSectionColor }}
+              />
+              <span className="font-medium text-neutral-800 truncate">{currentSectionTitle}</span>
+              {currentPageTitle && (
+                <>
+                  <span className="text-neutral-300">/</span>
+                  <span className="text-neutral-500 truncate">{currentPageTitle}</span>
+                </>
+              )}
+            </div>
+          )}
+
+          <div className="h-3.5 w-px bg-neutral-200/80 shrink-0 hidden sm:block" />
 
           {/* Quick Undo / Redo */}
-          <button
-            onClick={onUndo}
-            disabled={!historyManager.canUndo()}
-            className="p-1 hover:bg-neutral-100 rounded text-neutral-600 hover:text-neutral-900 disabled:opacity-25 transition-colors"
-            title="Undo (Ctrl+Z)"
-            aria-label="Undo"
-          >
-            <Undo2 className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={onRedo}
-            disabled={!historyManager.canRedo()}
-            className="p-1 hover:bg-neutral-100 rounded text-neutral-600 hover:text-neutral-900 disabled:opacity-25 transition-colors"
-            title="Redo (Ctrl+Y)"
-            aria-label="Redo"
-          >
-            <Redo2 className="w-3.5 h-3.5" />
-          </button>
+          <div className="flex items-center gap-0.5">
+            <button
+              onClick={onUndo}
+              disabled={!historyManager.canUndo()}
+              className="p-1 hover:bg-neutral-100 rounded text-neutral-500 hover:text-neutral-900 disabled:opacity-30 transition-colors focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none"
+              title="Undo (Ctrl+Z)"
+              aria-label="Undo"
+            >
+              <Undo2 className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={onRedo}
+              disabled={!historyManager.canRedo()}
+              className="p-1 hover:bg-neutral-100 rounded text-neutral-500 hover:text-neutral-900 disabled:opacity-30 transition-colors focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none"
+              title="Redo (Ctrl+Y)"
+              aria-label="Redo"
+            >
+              <Redo2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
 
-          <div className="h-3.5 w-px bg-neutral-200 mx-1" />
+          <div className="h-3.5 w-px bg-neutral-200/80 shrink-0" />
 
-          {/* Save Status Badge */}
+          {/* Compact Save Status */}
           {saveStatus === 'saving' && (
             <div className="flex items-center gap-1 text-[11px] text-neutral-500 font-mono">
-              <RotateCw className="w-3 h-3 animate-spin text-indigo-500" />
-              <span>Saving...</span>
+              <RotateCw className="w-3 h-3 animate-spin text-neutral-400" />
+              <span className="hidden md:inline">Saving</span>
             </div>
           )}
           {saveStatus === 'idle' && (
-            <div className="flex items-center gap-1 text-[11px] text-emerald-600 font-mono">
-              <CheckCircle2 className="w-3 h-3" />
-              <span>Saved locally</span>
+            <div className="flex items-center gap-1 text-[11px] text-emerald-600 font-medium">
+              <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+              <span className="hidden md:inline">Saved locally</span>
             </div>
           )}
           {saveStatus === 'error' && (
-            <div className="flex items-center gap-1 text-[11px] text-rose-600 font-mono">
-              <AlertTriangle className="w-3 h-3" />
-              <span>Save failed</span>
+            <div className="flex items-center gap-1 text-[11px] text-rose-600 font-medium">
+              <AlertTriangle className="w-3 h-3 text-rose-600" />
+              <span>Save error</span>
               <button
                 onClick={onRetrySave}
-                className="underline hover:text-rose-700 font-medium ml-0.5"
+                className="underline hover:text-rose-700 font-semibold ml-0.5"
               >
                 Retry
               </button>
@@ -175,95 +231,51 @@ export const OneNoteRibbon: React.FC<RibbonProps> = ({
           )}
         </div>
 
-        {/* Center: Tabs */}
-        <nav className="flex items-center gap-1 font-medium">
+        {/* Center: Primary Workspace Switcher (Distinguished from Drawing Tools) */}
+        <nav aria-label="Workspace" className="flex items-center p-0.5 bg-neutral-100/80 rounded-lg">
           <button
             onClick={() => setActiveTab('draw')}
-            className={`px-3 py-1.5 rounded-t-sm transition-colors border-b-2 ${
-              activeTab === 'draw'
-                ? 'border-indigo-600 text-indigo-700 font-semibold'
-                : 'border-transparent text-neutral-600 hover:text-neutral-900'
+            className={`px-3 py-1 rounded-md text-xs transition-all focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none ${
+              isNotebookWorkspace
+                ? 'bg-white text-neutral-900 font-semibold shadow-2xs'
+                : 'text-neutral-600 hover:text-neutral-900'
             }`}
           >
-            Draw
-          </button>
-
-          <button
-            onClick={() => setActiveTab('home')}
-            className={`px-3 py-1.5 rounded-t-sm transition-colors border-b-2 ${
-              activeTab === 'home'
-                ? 'border-indigo-600 text-indigo-700 font-semibold'
-                : 'border-transparent text-neutral-600 hover:text-neutral-900'
-            }`}
-          >
-            Notes & Text
-          </button>
-
-          <button
-            onClick={() => setActiveTab('view')}
-            className={`px-3 py-1.5 rounded-t-sm transition-colors border-b-2 ${
-              activeTab === 'view'
-                ? 'border-indigo-600 text-indigo-700 font-semibold'
-                : 'border-transparent text-neutral-600 hover:text-neutral-900'
-            }`}
-          >
-            Paper View
+            Notebook
           </button>
 
           <button
             onClick={() => setActiveTab('lab')}
-            className={`px-3 py-1.5 rounded-t-sm transition-colors border-b-2 flex items-center gap-1.5 ${
+            className={`px-3 py-1 rounded-md text-xs transition-all flex items-center gap-1.5 focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none ${
               activeTab === 'lab'
-                ? 'border-indigo-600 text-indigo-700 font-semibold'
-                : 'border-transparent text-indigo-600 hover:text-indigo-800'
+                ? 'bg-white text-indigo-700 font-semibold shadow-2xs'
+                : 'text-neutral-600 hover:text-neutral-900'
             }`}
           >
-            <Sparkles className="w-3.5 h-3.5" />
+            <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
             <span>Handwriting Lab</span>
-          </button>
-
-          <button
-            onClick={() => setActiveTab('dev')}
-            className={`px-3 py-1.5 rounded-t-sm transition-colors border-b-2 flex items-center gap-1 ${
-              activeTab === 'dev'
-                ? 'border-indigo-600 text-indigo-700 font-semibold'
-                : 'border-transparent text-neutral-500 hover:text-neutral-800'
-            }`}
-          >
-            <Code2 className="w-3 h-3" />
-            <span>Developer / C++</span>
           </button>
         </nav>
 
-        {/* Right: History & Export */}
+        {/* Right: Export, Focus Mode, and Secondary Menu */}
         <div className="flex items-center gap-1.5">
-          <button
-            onClick={onToggleHistory}
-            className={`flex items-center gap-1 px-2.5 py-1 rounded transition-colors ${
-              isHistoryOpen
-                ? 'bg-indigo-100 text-indigo-800 font-medium'
-                : 'text-neutral-600 hover:bg-neutral-100'
-            }`}
-            title="Inspect and rewind page history"
-            aria-label="Toggle history panel"
-          >
-            <History className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Page History</span>
-          </button>
-
           {/* Export / Backup Dropdown */}
-          <div className="relative">
+          <div className="relative ribbon-menu-container">
             <button
-              onClick={() => setShowExportMenu(!showExportMenu)}
-              className="flex items-center gap-1 px-2.5 py-1 rounded border border-neutral-300 text-neutral-700 hover:bg-neutral-50 transition-colors font-medium"
+              onClick={() => {
+                setShowExportMenu(!showExportMenu);
+                setShowSecondaryMenu(false);
+              }}
+              className="flex items-center gap-1 px-2.5 py-1 rounded-md border border-neutral-200 hover:bg-neutral-50 text-neutral-700 font-medium transition-colors focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none text-xs"
               aria-label="Export or backup notebook"
             >
-              <Download className="w-3.5 h-3.5" />
-              <span>Export</span>
+              <Download className="w-3.5 h-3.5 text-neutral-500" />
+              <span className="hidden sm:inline">Export</span>
+              <ChevronDown className="w-3 h-3 text-neutral-400" />
             </button>
 
             {showExportMenu && (
-              <div className="absolute right-0 top-9 w-48 bg-white border border-neutral-200 rounded-lg shadow-lg py-1.5 z-40 text-xs">
+              <div className="absolute right-0 top-8 w-52 bg-white border border-neutral-200 rounded-lg shadow-lg py-1.5 z-50 text-xs">
                 <button
                   onClick={() => {
                     onExportPDF();
@@ -320,130 +332,190 @@ export const OneNoteRibbon: React.FC<RibbonProps> = ({
             onChange={handleFileChange}
             className="hidden"
           />
+
+          {/* Focus Mode Button */}
+          {onToggleFocusMode && (
+            <button
+              onClick={onToggleFocusMode}
+              className={`p-1.5 rounded-md transition-colors text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100 focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none ${
+                isFocusMode ? 'bg-indigo-50 text-indigo-700' : ''
+              }`}
+              title={isFocusMode ? 'Exit Focus Mode (Esc)' : 'Focus Mode (F)'}
+              aria-label={isFocusMode ? 'Exit Focus Mode' : 'Enter Focus Mode'}
+            >
+              {isFocusMode ? (
+                <Minimize2 className="w-3.5 h-3.5" />
+              ) : (
+                <Maximize2 className="w-3.5 h-3.5" />
+              )}
+            </button>
+          )}
+
+          {/* Secondary Options Menu (...) */}
+          <div className="relative ribbon-menu-container">
+            <button
+              onClick={() => {
+                setShowSecondaryMenu(!showSecondaryMenu);
+                setShowExportMenu(false);
+              }}
+              className="p-1.5 rounded-md hover:bg-neutral-100 text-neutral-500 hover:text-neutral-800 transition-colors focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none"
+              title="More options"
+              aria-label="More options"
+            >
+              <MoreHorizontal className="w-4 h-4" />
+            </button>
+
+            {showSecondaryMenu && (
+              <div className="absolute right-0 top-8 w-48 bg-white border border-neutral-200 rounded-lg shadow-lg py-1.5 z-50 text-xs">
+                <button
+                  onClick={() => {
+                    onToggleHistory();
+                    setShowSecondaryMenu(false);
+                  }}
+                  className={`w-full text-left px-3 py-1.5 hover:bg-neutral-50 flex items-center justify-between ${
+                    isHistoryOpen ? 'text-indigo-600 font-medium' : 'text-neutral-700'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <History className="w-3.5 h-3.5 text-neutral-500" />
+                    <span>Page History</span>
+                  </div>
+                  {isHistoryOpen && <span className="text-[10px] text-indigo-600 font-mono">Open</span>}
+                </button>
+
+                <button
+                  onClick={() => {
+                    setActiveTab('dev');
+                    setShowSecondaryMenu(false);
+                  }}
+                  className={`w-full text-left px-3 py-1.5 hover:bg-neutral-50 flex items-center gap-2 ${
+                    activeTab === 'dev' ? 'text-indigo-600 font-medium' : 'text-neutral-700'
+                  }`}
+                >
+                  <Code2 className="w-3.5 h-3.5 text-neutral-500" />
+                  <span>Developer / C++</span>
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
-      {/* 2. Ribbon Content Row */}
-      {activeTab === 'draw' && (
-        <div className="h-14 px-3 flex items-center gap-3 overflow-x-auto bg-[#f8fafc]">
-          {/* Tools Mode */}
+      {/* 2. Drawing Toolbar Row (Cleaned up, calm, uniform dimensions) */}
+      {isNotebookWorkspace && (
+        <div className="h-10 px-3 bg-[#fafaf9] border-b border-neutral-200/60 flex items-center gap-2.5 overflow-x-auto text-xs">
+          {/* Drawing Tool Selector */}
           <div className="flex items-center gap-1">
             <button
               onClick={() => setActiveTool('pen')}
-              className={`flex flex-col items-center justify-center w-11 h-11 rounded-md transition-colors ${
+              className={`h-7 px-2.5 rounded-md flex items-center gap-1.5 transition-colors focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none ${
                 activeTool === 'pen'
-                  ? 'bg-indigo-100 text-indigo-700 font-semibold ring-1 ring-indigo-400'
-                  : 'hover:bg-neutral-200/70 text-neutral-700'
+                  ? 'bg-white text-indigo-700 font-semibold shadow-2xs ring-1 ring-neutral-200'
+                  : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-200/60'
               }`}
-              title="Ballpoint / Fountain Pen"
+              title="Pen (P)"
               aria-label="Pen tool"
             >
-              <Pen className="w-4 h-4" />
-              <span className="text-[10px] mt-0.5">Pen</span>
+              <Pen className="w-3.5 h-3.5" />
+              <span>Pen</span>
             </button>
 
             <button
               onClick={() => setActiveTool('highlighter')}
-              className={`flex flex-col items-center justify-center w-11 h-11 rounded-md transition-colors ${
+              className={`h-7 px-2.5 rounded-md flex items-center gap-1.5 transition-colors focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none ${
                 activeTool === 'highlighter'
-                  ? 'bg-indigo-100 text-indigo-700 font-semibold ring-1 ring-indigo-400'
-                  : 'hover:bg-neutral-200/70 text-neutral-700'
+                  ? 'bg-white text-indigo-700 font-semibold shadow-2xs ring-1 ring-neutral-200'
+                  : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-200/60'
               }`}
-              title="Translucent Chisel Highlighter"
+              title="Highlighter (H)"
               aria-label="Highlighter tool"
             >
-              <Highlighter className="w-4 h-4" />
-              <span className="text-[10px] mt-0.5">Highlight</span>
+              <Highlighter className="w-3.5 h-3.5" />
+              <span>Highlight</span>
             </button>
 
             <button
               onClick={() => setActiveTool('eraser')}
-              className={`flex flex-col items-center justify-center w-11 h-11 rounded-md transition-colors ${
+              className={`h-7 px-2.5 rounded-md flex items-center gap-1.5 transition-colors focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none ${
                 activeTool === 'eraser'
-                  ? 'bg-indigo-100 text-indigo-700 font-semibold ring-1 ring-indigo-400'
-                  : 'hover:bg-neutral-200/70 text-neutral-700'
+                  ? 'bg-white text-indigo-700 font-semibold shadow-2xs ring-1 ring-neutral-200'
+                  : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-200/60'
               }`}
-              title="Precision Segment & Stroke Eraser"
+              title="Eraser (E)"
               aria-label="Eraser tool"
             >
-              <Eraser className="w-4 h-4" />
-              <span className="text-[10px] mt-0.5">Eraser</span>
+              <Eraser className="w-3.5 h-3.5" />
+              <span>Eraser</span>
             </button>
 
             <button
               onClick={() => setActiveTool('text')}
-              className={`flex flex-col items-center justify-center w-11 h-11 rounded-md transition-colors ${
+              className={`h-7 px-2.5 rounded-md flex items-center gap-1.5 transition-colors focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none ${
                 activeTool === 'text'
-                  ? 'bg-indigo-100 text-indigo-700 font-semibold ring-1 ring-indigo-400'
-                  : 'hover:bg-neutral-200/70 text-neutral-700'
+                  ? 'bg-white text-indigo-700 font-semibold shadow-2xs ring-1 ring-neutral-200'
+                  : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-200/60'
               }`}
-              title="Type (Click anywhere to insert a movable note box)"
+              title="Type (T)"
               aria-label="Type tool"
             >
-              <Type className="w-4 h-4" />
-              <span className="text-[10px] mt-0.5">Type</span>
+              <Type className="w-3.5 h-3.5" />
+              <span>Text</span>
             </button>
 
             <button
               onClick={() => setActiveTool('pan')}
-              className={`flex flex-col items-center justify-center w-11 h-11 rounded-md transition-colors ${
+              className={`h-7 px-2.5 rounded-md flex items-center gap-1.5 transition-colors focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none ${
                 activeTool === 'pan'
-                  ? 'bg-indigo-100 text-indigo-700 font-semibold ring-1 ring-indigo-400'
-                  : 'hover:bg-neutral-200/70 text-neutral-700'
+                  ? 'bg-white text-indigo-700 font-semibold shadow-2xs ring-1 ring-neutral-200'
+                  : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-200/60'
               }`}
-              title="Pan / Navigation Hand"
+              title="Pan (V or hold Space)"
               aria-label="Pan tool"
             >
-              <Hand className="w-4 h-4" />
-              <span className="text-[10px] mt-0.5">Pan</span>
+              <Hand className="w-3.5 h-3.5" />
+              <span>Pan</span>
             </button>
           </div>
 
-          <div className="h-8 w-px bg-neutral-200" />
+          <div className="h-4 w-px bg-neutral-200 shrink-0" />
 
-          {/* Tool specific controls */}
-          {activeTool === 'pen' && (
-            <div className="flex items-center gap-2">
-              {/* Presets */}
-              <div className="flex items-center gap-1 bg-white p-1 rounded-md border border-neutral-200">
-                {PEN_PRESETS.map((pen, idx) => {
-                  const isSelected = activeColor === pen.hex;
-                  return (
-                    <button
-                      key={idx}
-                      onClick={() => {
-                        setActiveColor(pen.hex);
-                        setBaseWidth(pen.width);
-                      }}
-                      className={`flex flex-col items-center justify-between w-8 h-10 p-1 rounded transition-all ${
-                        isSelected
-                          ? 'ring-2 ring-indigo-600 bg-indigo-50/60 scale-105'
-                          : 'opacity-80 hover:opacity-100 hover:bg-neutral-50'
-                      }`}
-                      title={pen.name}
-                      aria-label={pen.name}
-                    >
-                      <div className="w-2 h-5 rounded-xs" style={{ backgroundColor: pen.hex }} />
-                      <span className="text-[9px] font-mono text-neutral-500">{pen.width}pt</span>
-                    </button>
-                  );
-                })}
-              </div>
+          {/* Active Tool Specific Settings Area */}
+          <div className="flex items-center gap-2">
+            {activeTool === 'pen' && (
+              <div className="flex items-center gap-2">
+                {/* Clean Pen Color Palette Dots (NO repeated width labels) */}
+                <div className="flex items-center gap-1.5 bg-white px-2 py-1 rounded-md border border-neutral-200/80 shadow-2xs">
+                  {PEN_COLORS.map((pen) => {
+                    const isSelected = activeColor === pen.hex;
+                    return (
+                      <button
+                        key={pen.hex}
+                        onClick={() => setActiveColor(pen.hex)}
+                        style={{ backgroundColor: pen.hex }}
+                        className={`w-4 h-4 rounded-full border border-black/15 transition-transform ${
+                          isSelected ? 'scale-125 ring-2 ring-indigo-500/80' : 'hover:scale-110'
+                        }`}
+                        title={pen.name}
+                        aria-label={pen.name}
+                      />
+                    );
+                  })}
 
-              {/* Custom Color input */}
-              <div className="flex items-center gap-1.5 bg-white px-2 py-1 rounded-md border border-neutral-200 text-xs">
-                <input
-                  type="color"
-                  value={activeColor}
-                  onChange={(e) => setActiveColor(e.target.value)}
-                  className="w-5 h-5 rounded cursor-pointer border-0 p-0"
-                  title="Choose custom ink color"
-                  aria-label="Custom ink color"
-                />
+                  <input
+                    type="color"
+                    value={activeColor}
+                    onChange={(e) => setActiveColor(e.target.value)}
+                    className="w-4 h-4 rounded-full cursor-pointer border-0 p-0 ml-0.5 overflow-hidden"
+                    title="Custom color"
+                    aria-label="Custom color picker"
+                  />
+                </div>
+
+                {/* Single Pen Thickness Selector */}
                 <select
                   value={baseWidth}
                   onChange={(e) => setBaseWidth(parseFloat(e.target.value))}
-                  className="text-xs bg-transparent focus:outline-none cursor-pointer"
+                  className="h-7 text-xs bg-white px-2 rounded-md border border-neutral-200/80 focus:outline-none focus:border-indigo-500 cursor-pointer shadow-2xs"
                   title="Pen Thickness"
                   aria-label="Pen thickness"
                 >
@@ -453,38 +525,34 @@ export const OneNoteRibbon: React.FC<RibbonProps> = ({
                   <option value={5.0}>Bold (5.0pt)</option>
                 </select>
               </div>
-            </div>
-          )}
+            )}
 
-          {activeTool === 'highlighter' && (
-            <div className="flex items-center gap-2">
-              <div className="flex items-center gap-1 bg-white p-1 rounded-md border border-neutral-200">
-                {HIGHLIGHTER_PRESETS.map((hl, idx) => {
-                  const isSelected = activeColor === hl.hex;
-                  return (
-                    <button
-                      key={idx}
-                      onClick={() => setActiveColor(hl.hex)}
-                      className={`w-7 h-10 p-1 rounded flex items-center justify-center transition-all ${
-                        isSelected
-                          ? 'ring-2 ring-indigo-600 bg-indigo-50/60 scale-105'
-                          : 'opacity-70 hover:opacity-100 hover:bg-neutral-50'
-                      }`}
-                      title={hl.name}
-                      aria-label={hl.name}
-                    >
-                      <div className="w-3.5 h-6 rounded-xs" style={{ backgroundColor: hl.hex }} />
-                    </button>
-                  );
-                })}
-              </div>
+            {activeTool === 'highlighter' && (
+              <div className="flex items-center gap-2">
+                {/* Highlighter Color Palette Dots */}
+                <div className="flex items-center gap-1.5 bg-white px-2 py-1 rounded-md border border-neutral-200/80 shadow-2xs">
+                  {HIGHLIGHTER_COLORS.map((hl) => {
+                    const isSelected = activeColor === hl.hex;
+                    return (
+                      <button
+                        key={hl.hex}
+                        onClick={() => setActiveColor(hl.hex)}
+                        style={{ backgroundColor: hl.hex }}
+                        className={`w-4 h-4 rounded-full border border-black/15 transition-transform ${
+                          isSelected ? 'scale-125 ring-2 ring-indigo-500/80' : 'hover:scale-110'
+                        }`}
+                        title={hl.name}
+                        aria-label={hl.name}
+                      />
+                    );
+                  })}
+                </div>
 
-              <div className="bg-white px-2 py-1 rounded-md border border-neutral-200 text-xs flex items-center gap-1.5">
-                <span className="text-neutral-500">Width:</span>
                 <select
                   value={highlighterWidth}
                   onChange={(e) => setHighlighterWidth(parseFloat(e.target.value))}
-                  className="text-xs bg-transparent focus:outline-none cursor-pointer"
+                  className="h-7 text-xs bg-white px-2 rounded-md border border-neutral-200/80 focus:outline-none focus:border-indigo-500 cursor-pointer shadow-2xs"
+                  title="Highlighter Width"
                   aria-label="Highlighter width"
                 >
                   <option value={10}>Narrow (10pt)</option>
@@ -492,17 +560,16 @@ export const OneNoteRibbon: React.FC<RibbonProps> = ({
                   <option value={24}>Wide (24pt)</option>
                 </select>
               </div>
-            </div>
-          )}
+            )}
 
-          {activeTool === 'eraser' && (
-            <div className="flex items-center gap-2 bg-white px-2.5 py-1.5 rounded-md border border-neutral-200 text-xs">
-              <span className="text-neutral-500">Eraser Size:</span>
-              <div className="flex items-center gap-1">
+            {activeTool === 'eraser' && (
+              <div className="flex items-center gap-1 bg-white p-0.5 rounded-md border border-neutral-200/80 shadow-2xs text-xs">
                 <button
                   onClick={() => setEraserRadius(10)}
                   className={`px-2 py-0.5 rounded transition-colors ${
-                    eraserRadius === 10 ? 'bg-indigo-100 text-indigo-700 font-semibold' : 'hover:bg-neutral-100'
+                    eraserRadius === 10
+                      ? 'bg-neutral-200/80 text-neutral-900 font-semibold'
+                      : 'text-neutral-600 hover:text-neutral-900'
                   }`}
                 >
                   Small
@@ -510,7 +577,9 @@ export const OneNoteRibbon: React.FC<RibbonProps> = ({
                 <button
                   onClick={() => setEraserRadius(20)}
                   className={`px-2 py-0.5 rounded transition-colors ${
-                    eraserRadius === 20 ? 'bg-indigo-100 text-indigo-700 font-semibold' : 'hover:bg-neutral-100'
+                    eraserRadius === 20
+                      ? 'bg-neutral-200/80 text-neutral-900 font-semibold'
+                      : 'text-neutral-600 hover:text-neutral-900'
                   }`}
                 >
                   Medium
@@ -518,41 +587,80 @@ export const OneNoteRibbon: React.FC<RibbonProps> = ({
                 <button
                   onClick={() => setEraserRadius(35)}
                   className={`px-2 py-0.5 rounded transition-colors ${
-                    eraserRadius === 35 ? 'bg-indigo-100 text-indigo-700 font-semibold' : 'hover:bg-neutral-100'
+                    eraserRadius === 35
+                      ? 'bg-neutral-200/80 text-neutral-900 font-semibold'
+                      : 'text-neutral-600 hover:text-neutral-900'
                   }`}
                 >
                   Large
                 </button>
               </div>
-            </div>
-          )}
+            )}
 
-          <div className="h-8 w-px bg-neutral-200" />
+            {activeTool === 'text' && (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={onInsertTextBox}
+                  className="h-7 px-2.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition-colors shadow-xs flex items-center gap-1.5"
+                  aria-label="Insert text note box"
+                >
+                  <Type className="w-3.5 h-3.5" />
+                  <span>Insert Note</span>
+                </button>
+                <span className="text-[11px] text-neutral-500 hidden lg:inline">
+                  Click canvas surface to place note
+                </span>
+              </div>
+            )}
 
-          {/* Paper Pattern Selector */}
-          <div className="relative">
+            {activeTool === 'pan' && (
+              <span className="text-[11px] text-neutral-500 font-sans">
+                Drag canvas to navigate · Scroll to zoom
+              </span>
+            )}
+          </div>
+
+          <div className="h-4 w-px bg-neutral-200 shrink-0 ml-auto" />
+
+          {/* Paper Rule / Grid Dropdown */}
+          <div className="relative ribbon-menu-container">
             <button
-              onClick={() => setShowPatternPicker(!showPatternPicker)}
-              className="flex flex-col items-center justify-center px-2.5 h-11 rounded-md hover:bg-neutral-200/70 text-neutral-700 transition-colors"
-              title="Paper Rule Lines (Ruled, Grid, Dot, Blank)"
+              onClick={() => {
+                setShowPatternPicker(!showPatternPicker);
+                setShowExportMenu(false);
+                setShowSecondaryMenu(false);
+              }}
+              className="h-7 px-2.5 rounded-md border border-neutral-200/80 bg-white hover:bg-neutral-50 text-neutral-700 font-medium transition-colors flex items-center gap-1.5 text-xs shadow-2xs"
+              title="Change paper rule lines"
               aria-label="Change paper rule lines"
             >
               {backgroundPattern === 'grid' ? (
-                <Grid className="w-4 h-4" />
+                <Grid className="w-3.5 h-3.5 text-indigo-600" />
               ) : (
-                <AlignJustify className="w-4 h-4" />
+                <AlignJustify className="w-3.5 h-3.5 text-indigo-600" />
               )}
-              <span className="text-[10px] mt-0.5">Paper Grid</span>
+              <span className="capitalize">
+                {backgroundPattern === 'lined'
+                  ? 'Ruled'
+                  : backgroundPattern === 'dotgrid'
+                  ? 'Dot Grid'
+                  : backgroundPattern === 'grid'
+                  ? 'Graph Grid'
+                  : 'Blank'}
+              </span>
+              <ChevronDown className="w-3 h-3 text-neutral-400" />
             </button>
 
             {showPatternPicker && (
-              <div className="absolute top-12 left-0 w-36 bg-white border border-neutral-200 rounded-lg shadow-lg py-1.5 z-40 text-xs">
+              <div className="absolute right-0 top-8 w-36 bg-white border border-neutral-200 rounded-lg shadow-lg py-1 z-50 text-xs">
                 <button
                   onClick={() => {
                     setBackgroundPattern('lined');
                     setShowPatternPicker(false);
                   }}
-                  className="w-full text-left px-3 py-1.5 hover:bg-neutral-50 flex items-center gap-2"
+                  className={`w-full text-left px-3 py-1.5 hover:bg-neutral-50 flex items-center gap-2 ${
+                    backgroundPattern === 'lined' ? 'text-indigo-600 font-semibold' : 'text-neutral-700'
+                  }`}
                 >
                   <AlignJustify className="w-3.5 h-3.5 text-indigo-600" />
                   <span>Ruled Paper</span>
@@ -562,7 +670,9 @@ export const OneNoteRibbon: React.FC<RibbonProps> = ({
                     setBackgroundPattern('grid');
                     setShowPatternPicker(false);
                   }}
-                  className="w-full text-left px-3 py-1.5 hover:bg-neutral-50 flex items-center gap-2"
+                  className={`w-full text-left px-3 py-1.5 hover:bg-neutral-50 flex items-center gap-2 ${
+                    backgroundPattern === 'grid' ? 'text-indigo-600 font-semibold' : 'text-neutral-700'
+                  }`}
                 >
                   <Grid className="w-3.5 h-3.5 text-indigo-600" />
                   <span>Graph Grid</span>
@@ -572,9 +682,11 @@ export const OneNoteRibbon: React.FC<RibbonProps> = ({
                     setBackgroundPattern('dotgrid');
                     setShowPatternPicker(false);
                   }}
-                  className="w-full text-left px-3 py-1.5 hover:bg-neutral-50 flex items-center gap-2"
+                  className={`w-full text-left px-3 py-1.5 hover:bg-neutral-50 flex items-center gap-2 ${
+                    backgroundPattern === 'dotgrid' ? 'text-indigo-600 font-semibold' : 'text-neutral-700'
+                  }`}
                 >
-                  <span className="w-3.5 h-3.5 text-center font-bold">·</span>
+                  <span className="w-3.5 text-center font-bold text-indigo-600">·</span>
                   <span>Dot Grid</span>
                 </button>
                 <button
@@ -582,92 +694,29 @@ export const OneNoteRibbon: React.FC<RibbonProps> = ({
                     setBackgroundPattern('blank');
                     setShowPatternPicker(false);
                   }}
-                  className="w-full text-left px-3 py-1.5 hover:bg-neutral-50 flex items-center gap-2"
+                  className={`w-full text-left px-3 py-1.5 hover:bg-neutral-50 flex items-center gap-2 ${
+                    backgroundPattern === 'blank' ? 'text-indigo-600 font-semibold' : 'text-neutral-700'
+                  }`}
                 >
-                  <span className="w-3.5 h-3.5 border border-dashed border-neutral-400 rounded-xs" />
+                  <span className="w-3 h-3 border border-dashed border-neutral-400 rounded-xs" />
                   <span>Blank Paper</span>
                 </button>
               </div>
             )}
           </div>
 
-          {/* Clear Ink (Accurately labeled, preserves text, recoverable via undo) */}
+          <div className="h-4 w-px bg-neutral-200 shrink-0" />
+
+          {/* Destructive Clear Ink (Visually separated, accurately labeled, recoverable via undo) */}
           <button
             onClick={onClearInk}
-            className="flex flex-col items-center justify-center px-2.5 h-11 rounded-md hover:bg-neutral-200/70 text-neutral-600 hover:text-rose-600 transition-colors"
-            title="Clear Ink Strokes (Typed text boxes and title are retained; recoverable with Undo)"
+            className="h-7 px-2 rounded-md hover:bg-rose-50 text-neutral-500 hover:text-rose-600 transition-colors flex items-center gap-1"
+            title="Clear Ink Strokes (Text boxes and title are preserved; recoverable with Undo)"
             aria-label="Clear Ink"
           >
-            <Trash2 className="w-4 h-4" />
-            <span className="text-[10px] mt-0.5">Clear Ink</span>
+            <Trash2 className="w-3.5 h-3.5" />
+            <span className="text-[11px] hidden sm:inline">Clear Ink</span>
           </button>
-        </div>
-      )}
-
-      {activeTab === 'home' && (
-        <div className="h-14 px-3 flex items-center gap-3 text-xs bg-[#f8fafc]">
-          <button
-            onClick={onInsertTextBox}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition-colors shadow-xs"
-            aria-label="Insert text box"
-          >
-            <Type className="w-4 h-4" />
-            <span>Insert Text Box</span>
-          </button>
-
-          <div className="h-6 w-px bg-neutral-200" />
-
-          <p className="text-neutral-500 font-sans">
-            Click <strong>Type</strong> on the Draw tab or click anywhere on the page surface to place movable text containers alongside handwritten equations and diagrams.
-          </p>
-        </div>
-      )}
-
-      {activeTab === 'view' && (
-        <div className="h-14 px-3 flex items-center gap-3 text-xs bg-[#f8fafc]">
-          <span className="font-semibold text-neutral-600">Paper Style:</span>
-          <div className="flex items-center gap-1 bg-white p-1 rounded-md border border-neutral-200">
-            <button
-              onClick={() => setBackgroundPattern('lined')}
-              className={`px-3 py-1 rounded transition-colors ${
-                backgroundPattern === 'lined'
-                  ? 'bg-indigo-100 text-indigo-800 font-medium'
-                  : 'hover:bg-neutral-100'
-              }`}
-            >
-              Ruled Lines
-            </button>
-            <button
-              onClick={() => setBackgroundPattern('grid')}
-              className={`px-3 py-1 rounded transition-colors ${
-                backgroundPattern === 'grid'
-                  ? 'bg-indigo-100 text-indigo-800 font-medium'
-                  : 'hover:bg-neutral-100'
-              }`}
-            >
-              Graph Grid
-            </button>
-            <button
-              onClick={() => setBackgroundPattern('dotgrid')}
-              className={`px-3 py-1 rounded transition-colors ${
-                backgroundPattern === 'dotgrid'
-                  ? 'bg-indigo-100 text-indigo-800 font-medium'
-                  : 'hover:bg-neutral-100'
-              }`}
-            >
-              Dot Grid
-            </button>
-            <button
-              onClick={() => setBackgroundPattern('blank')}
-              className={`px-3 py-1 rounded transition-colors ${
-                backgroundPattern === 'blank'
-                  ? 'bg-indigo-100 text-indigo-800 font-medium'
-                  : 'hover:bg-neutral-100'
-              }`}
-            >
-              Blank
-            </button>
-          </div>
         </div>
       )}
     </header>

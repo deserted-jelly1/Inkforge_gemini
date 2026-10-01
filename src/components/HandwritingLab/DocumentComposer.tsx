@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { HandwritingProfile, LayoutOptions, ComposerDocument } from '../../handwriting/types';
+import { DraftManagerState, DraftSaveStatus } from '../../handwriting/draftManager';
 import { SampleBasedHandwritingRenderer, exportPagesToPDF } from '../../handwriting/sampleRenderer';
 import {
   FileText,
@@ -11,14 +12,18 @@ import {
   Sliders,
   RotateCw,
   CheckCircle2,
+  RefreshCw,
 } from 'lucide-react';
 
 interface DocumentComposerProps {
   profile: HandwritingProfile | null;
-  draft: ComposerDocument;
+  draft: ComposerDocument | null;
+  draftManagerState: DraftManagerState;
+  draftLoadError: string | null;
+  draftSaveStatus: DraftSaveStatus;
   onUpdateDraft: (updated: ComposerDocument) => void;
-  draftSaveStatus: 'idle' | 'saving' | 'error';
   onRetrySaveDraft: () => void;
+  onRetryLoadDraft: () => void;
 }
 
 export const PRESET_TEXTS = [
@@ -47,18 +52,30 @@ Milestone 3: Export vector SVG and multipage PDF documents for print and revisio
   },
 ];
 
+const DEFAULT_OPTIONS: LayoutOptions = {
+  pageWidth: 595,
+  pageHeight: 842,
+  margins: { top: 48, right: 48, bottom: 48, left: 48 },
+  fontSize: 24,
+  lineHeight: 1.5,
+  letterSpacing: 1.0,
+  wordSpacing: 1.0,
+};
+
 export const DocumentComposer: React.FC<DocumentComposerProps> = ({
   profile,
   draft,
-  onUpdateDraft,
+  draftManagerState,
+  draftLoadError,
   draftSaveStatus,
+  onUpdateDraft,
   onRetrySaveDraft,
+  onRetryLoadDraft,
 }) => {
   const [currentPageIndex, setCurrentPageIndex] = useState<number>(0);
   const [exportError, setExportError] = useState<string | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Fallback empty profile if no profile is active
   const effectiveProfile: HandwritingProfile = useMemo(() => {
     if (profile) return profile;
     return {
@@ -72,16 +89,18 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({
     };
   }, [profile]);
 
-  // Renderer instance
   const renderer = useMemo(
     () => new SampleBasedHandwritingRenderer(effectiveProfile),
     [effectiveProfile]
   );
 
+  const draftText = draft?.text ?? '';
+  const draftOptions = draft?.options ?? DEFAULT_OPTIONS;
+
   // Compute paginated layout using draft options
   const pages = useMemo(() => {
-    return renderer.layoutText(draft.text, draft.options);
-  }, [renderer, draft.text, draft.options]);
+    return renderer.layoutText(draftText, draftOptions);
+  }, [renderer, draftText, draftOptions]);
 
   // Adjust page index when page count changes
   useEffect(() => {
@@ -109,8 +128,11 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({
     return Array.from(set);
   }, [pages]);
 
+  const isEditingDisabled = draftManagerState !== 'ready' || !draft;
+
   // Handlers for draft mutations
   const handleTextChange = (newText: string) => {
+    if (isEditingDisabled || !draft) return;
     onUpdateDraft({
       ...draft,
       text: newText,
@@ -119,6 +141,7 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({
   };
 
   const handleOptionChange = (key: keyof LayoutOptions, val: number) => {
+    if (isEditingDisabled || !draft) return;
     onUpdateDraft({
       ...draft,
       options: {
@@ -130,6 +153,7 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({
   };
 
   const handleApplyPreset = (presetText: string) => {
+    if (isEditingDisabled || !draft) return;
     if (draft.text.trim().length > 0 && draft.text !== presetText) {
       const confirmReplace = window.confirm(
         'Replace current draft text with preset? Your custom changes in this draft will be overwritten.'
@@ -185,7 +209,7 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({
                   <span>Saving draft...</span>
                 </div>
               )}
-              {draftSaveStatus === 'idle' && (
+              {draftSaveStatus === 'idle' && draftManagerState === 'ready' && (
                 <div className="flex items-center gap-1 text-[11px] text-emerald-600 font-mono">
                   <CheckCircle2 className="w-3 h-3" />
                   <span>Saved locally</span>
@@ -209,8 +233,9 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({
               {PRESET_TEXTS.map((preset, idx) => (
                 <button
                   key={idx}
+                  disabled={isEditingDisabled}
                   onClick={() => handleApplyPreset(preset.text)}
-                  className="px-2 py-0.5 rounded text-[11px] bg-neutral-100 hover:bg-neutral-200 text-neutral-700 transition-colors"
+                  className="px-2 py-0.5 rounded text-[11px] bg-neutral-100 hover:bg-neutral-200 text-neutral-700 transition-colors disabled:opacity-40"
                   title={preset.name}
                 >
                   Preset {idx + 1}
@@ -224,13 +249,43 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({
           </p>
         </div>
 
+        {/* Load Error Banner if draft reading failed */}
+        {draftManagerState === 'load_error' && (
+          <div className="bg-rose-50 border-b border-rose-200 p-3 space-y-2">
+            <div className="flex items-start gap-2 text-rose-800 text-[11px]">
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold">Draft Storage Read Failure</p>
+                <p className="text-rose-600 mt-0.5">
+                  {draftLoadError || 'Could not load saved draft from storage.'}
+                </p>
+                <p className="text-neutral-500 mt-1">
+                  Editing is locked to prevent overwriting your saved work. Click Retry to restore your document.
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={onRetryLoadDraft}
+              className="flex items-center gap-1.5 px-3 py-1 rounded bg-rose-600 text-white font-medium hover:bg-rose-700 transition-colors shadow-xs"
+            >
+              <RefreshCw className="w-3 h-3" />
+              <span>Retry Load Draft</span>
+            </button>
+          </div>
+        )}
+
         {/* Text Area */}
         <div className="flex-1 p-3 flex flex-col">
           <textarea
-            value={draft.text}
+            value={draftText}
+            disabled={isEditingDisabled}
             onChange={(e) => handleTextChange(e.target.value)}
-            placeholder="Type your notes or document text here..."
-            className="w-full flex-1 p-3 bg-neutral-50 border border-neutral-200 rounded-lg text-xs font-mono text-neutral-800 focus:outline-none focus:border-indigo-500 focus:bg-white resize-none leading-relaxed transition-colors"
+            placeholder={
+              draftManagerState === 'load_error'
+                ? 'Draft loading failed. Please click Retry Load Draft above.'
+                : 'Type your notes or document text here...'
+            }
+            className="w-full flex-1 p-3 bg-neutral-50 border border-neutral-200 rounded-lg text-xs font-mono text-neutral-800 focus:outline-none focus:border-indigo-500 focus:bg-white resize-none leading-relaxed transition-colors disabled:opacity-50 disabled:bg-neutral-100"
           />
         </div>
 
@@ -245,64 +300,68 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({
             <div>
               <div className="flex justify-between text-neutral-500 mb-1">
                 <span>Font Size</span>
-                <span className="font-mono">{draft.options.fontSize}pt</span>
+                <span className="font-mono">{draftOptions.fontSize}pt</span>
               </div>
               <input
                 type="range"
+                disabled={isEditingDisabled}
                 min="18"
                 max="40"
                 step="1"
-                value={draft.options.fontSize}
+                value={draftOptions.fontSize}
                 onChange={(e) => handleOptionChange('fontSize', parseInt(e.target.value))}
-                className="w-full h-1 bg-neutral-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                className="w-full h-1 bg-neutral-200 rounded-lg appearance-none cursor-pointer accent-indigo-600 disabled:opacity-40"
               />
             </div>
 
             <div>
               <div className="flex justify-between text-neutral-500 mb-1">
                 <span>Line Height</span>
-                <span className="font-mono">{draft.options.lineHeight}x</span>
+                <span className="font-mono">{draftOptions.lineHeight}x</span>
               </div>
               <input
                 type="range"
+                disabled={isEditingDisabled}
                 min="1.2"
                 max="2.2"
                 step="0.1"
-                value={draft.options.lineHeight}
+                value={draftOptions.lineHeight}
                 onChange={(e) => handleOptionChange('lineHeight', parseFloat(e.target.value))}
-                className="w-full h-1 bg-neutral-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                className="w-full h-1 bg-neutral-200 rounded-lg appearance-none cursor-pointer accent-indigo-600 disabled:opacity-40"
               />
             </div>
 
             <div>
               <div className="flex justify-between text-neutral-500 mb-1">
                 <span>Letter Spacing</span>
-                <span className="font-mono">{draft.options.letterSpacing.toFixed(1)}x</span>
+                <span className="font-mono">{draftOptions.letterSpacing.toFixed(1)}x</span>
               </div>
               <input
                 type="range"
+                disabled={isEditingDisabled}
                 min="0.8"
                 max="1.5"
                 step="0.05"
-                value={draft.options.letterSpacing}
+                value={draftOptions.letterSpacing}
                 onChange={(e) => handleOptionChange('letterSpacing', parseFloat(e.target.value))}
-                className="w-full h-1 bg-neutral-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                className="w-full h-1 bg-neutral-200 rounded-lg appearance-none cursor-pointer accent-indigo-600 disabled:opacity-40"
               />
             </div>
 
             <div>
               <div className="flex justify-between text-neutral-500 mb-1">
                 <span>Word Spacing</span>
-                <span className="font-mono">{draft.options.wordSpacing.toFixed(1)}x</span>
+                <span className="font-mono">{draftOptions.wordSpacing.toFixed(1)}x</span>
               </div>
               <input
                 type="range"
+                disabled={isEditingDisabled}
                 min="0.8"
                 max="2.0"
                 step="0.1"
-                value={draft.options.wordSpacing}
+                value={draftOptions.wordSpacing}
                 onChange={(e) => handleOptionChange('wordSpacing', parseFloat(e.target.value))}
-                className="w-full h-1 bg-neutral-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                className="w-full h-1 bg-neutral-200 rounded-lg appearance-none cursor-pointer accent-indigo-600 disabled:opacity-40"
               />
             </div>
           </div>
@@ -380,35 +439,35 @@ export const DocumentComposer: React.FC<DocumentComposerProps> = ({
           </div>
         )}
 
-        {/* Missing Characters Alert Banner */}
+        {/* Plain-Language Missing Characters Notice */}
         {allMissingChars.length > 0 && (
-          <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 flex items-center gap-2 text-amber-800 text-[11px]">
+          <div className="bg-amber-50/90 border-b border-amber-200/80 px-4 py-2 flex items-center gap-2 text-amber-900 text-xs">
             <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
             <span>
-              <strong>Missing characters in profile &quot;{effectiveProfile.name}&quot;:</strong>{' '}
+              <strong>{allMissingChars.length} character{allMissingChars.length > 1 ? 's are' : ' is'} not yet captured in &quot;{effectiveProfile.name}&quot;:</strong>{' '}
               {allMissingChars.map((c) => (
                 <span
                   key={c}
-                  className="font-mono bg-amber-100 text-amber-900 px-1 rounded mr-1"
+                  className="font-mono font-semibold bg-amber-100/80 text-amber-950 px-1 py-0.5 rounded mr-1"
                 >
                   {c === ' ' ? 'space' : c}
                 </span>
               ))}
-              (highlighted in dashed amber boxes in preview)
+              (shown in dashed amber boxes). Capture them in Character Studio or continue composing.
             </span>
           </div>
         )}
 
-        {/* Canvas Document Scroll Container */}
-        <div className="flex-1 overflow-auto p-6 flex justify-center items-start">
-          <div className="bg-white rounded-lg shadow-xl border border-neutral-300 p-1">
+        {/* Canvas Document Scroll Container with desk styling */}
+        <div className="flex-1 overflow-auto p-8 flex justify-center items-start bg-[#eceae4]">
+          <div className="bg-white rounded-sm shadow-md border border-neutral-300/80 transition-shadow">
             <canvas
               ref={canvasRef}
               style={{
-                width: `${draft.options.pageWidth}px`,
-                height: `${draft.options.pageHeight}px`,
+                width: `${draftOptions.pageWidth}px`,
+                height: `${draftOptions.pageHeight}px`,
               }}
-              className="block bg-white rounded-md"
+              className="block bg-white rounded-sm"
             />
           </div>
         </div>

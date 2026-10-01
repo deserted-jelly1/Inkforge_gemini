@@ -17,7 +17,7 @@ import {
   UpdateTextNoteCommand,
 } from '../utils/historyManager';
 import { strokeIntersectsEraser, isStrokeInViewport } from '../utils/geometry';
-import { X, Move, GripVertical, ZoomIn, ZoomOut } from 'lucide-react';
+import { X, Move, GripVertical, ZoomIn, ZoomOut, Minimize2 } from 'lucide-react';
 
 interface CanvasProps {
   page: PageData;
@@ -31,6 +31,8 @@ interface CanvasProps {
   historyManager: PageHistoryManager;
   newNoteFocusId: string | null;
   onClearNewNoteFocus: () => void;
+  isFocusMode?: boolean;
+  onToggleFocusMode?: () => void;
 }
 
 export const OneNoteCanvas: React.FC<CanvasProps> = ({
@@ -45,6 +47,8 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
   historyManager,
   newNoteFocusId,
   onClearNewNoteFocus,
+  isFocusMode = false,
+  onToggleFocusMode,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const baseCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -199,18 +203,18 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     const width = canvas.width / dpr;
     const height = canvas.height / dpr;
 
-    // Pristine paper background
-    ctx.fillStyle = '#ffffff';
+    // Pristine warm paper background
+    ctx.fillStyle = '#fdfcf7';
     ctx.fillRect(0, 0, width, height);
 
     // Ruled lines / Grid based on world coordinates
     const spacing = (page.gridSpacing || 28) * zoom;
-    const headerWorldY = 120;
+    const headerWorldY = 110;
     const headerScreenY = worldToScreen(0, headerWorldY).y;
     const offsetY = pan.y % spacing;
 
     if (backgroundPattern === 'lined') {
-      ctx.strokeStyle = '#e2e8f0';
+      ctx.strokeStyle = '#e7e5e4';
       ctx.lineWidth = 1.0;
       ctx.beginPath();
       for (let y = Math.max(headerScreenY, offsetY); y < height; y += spacing) {
@@ -219,11 +223,11 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
       }
       ctx.stroke();
 
-      // Vertical pink margin guide line
+      // Vertical subtle margin guide line
       const marginWorldX = 72;
       const marginScreenX = worldToScreen(marginWorldX, 0).x;
       if (marginScreenX >= 0 && marginScreenX <= width) {
-        ctx.strokeStyle = '#fecdd3';
+        ctx.strokeStyle = '#fca5a5';
         ctx.lineWidth = 1.0;
         ctx.beginPath();
         ctx.moveTo(marginScreenX, Math.max(0, headerScreenY));
@@ -232,7 +236,7 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
       }
     } else if (backgroundPattern === 'grid') {
       const offsetX = pan.x % spacing;
-      ctx.strokeStyle = '#f1f5f9';
+      ctx.strokeStyle = '#f0eee9';
       ctx.lineWidth = 1.0;
       ctx.beginPath();
       for (let x = offsetX; x < width; x += spacing) {
@@ -873,7 +877,7 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
     <div
       ref={containerRef}
       onWheel={handleWheel}
-      className="flex-1 relative overflow-hidden bg-white select-none touch-none cursor-crosshair"
+      className="flex-1 relative overflow-hidden bg-[#fdfcf7] select-none touch-none cursor-crosshair"
     >
       {/* Layer 1: Base Canvas */}
       <canvas
@@ -891,6 +895,19 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
         className="absolute inset-0 w-full h-full block touch-none z-10"
       />
 
+      {/* Floating Exit Focus Mode Button */}
+      {isFocusMode && onToggleFocusMode && (
+        <button
+          onClick={onToggleFocusMode}
+          className="absolute top-4 right-4 z-40 bg-white/95 backdrop-blur-md border border-neutral-200/90 rounded-full px-3.5 py-1.5 shadow-sm text-xs font-medium text-neutral-700 hover:text-neutral-900 hover:border-neutral-300 flex items-center gap-1.5 transition-colors focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none"
+          title="Exit Focus Mode (Esc or F)"
+          aria-label="Exit Focus Mode"
+        >
+          <Minimize2 className="w-3.5 h-3.5 text-neutral-500" />
+          <span>Exit Focus (Esc)</span>
+        </button>
+      )}
+
       {/* Synchronized Editable Page Title & Date Header */}
       <div
         style={{
@@ -900,7 +917,7 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
           transform: `scale(${zoom})`,
           transformOrigin: 'top left',
         }}
-        className="pointer-events-auto w-[680px] space-y-1 z-20"
+        className="pointer-events-auto w-[680px] space-y-0.5 z-20"
       >
         <input
           type="text"
@@ -910,17 +927,17 @@ export const OneNoteCanvas: React.FC<CanvasProps> = ({
             const newTitle = e.target.value;
             onUpdatePage((prev) => ({ ...prev, title: newTitle, updatedAt: Date.now() }));
           }}
-          className="w-full text-2xl font-semibold text-neutral-900 bg-transparent border-b border-transparent hover:border-neutral-300 focus:border-indigo-600 focus:outline-none transition-colors px-1 py-0.5"
+          className="w-full text-2xl font-semibold text-neutral-900 bg-transparent border-b border-transparent hover:border-neutral-300 focus:border-indigo-600 focus:outline-none transition-colors px-0.5 py-0.5"
           aria-label="Page Title"
         />
 
-        <div className="flex items-center gap-2 text-[11px] font-sans text-neutral-500 px-1">
+        <div className="flex items-center gap-2 text-[11px] font-sans text-neutral-400 px-0.5">
           <span>{formattedDate}</span>
           <span aria-hidden="true">·</span>
           <span>{formattedTime}</span>
         </div>
 
-        <div className="w-full h-px bg-neutral-300 mt-2" />
+        <div className="w-full h-px bg-neutral-200/80 mt-1.5" />
       </div>
 
       {/* Text Containers (Document coordinate width, single scale transform) */}
