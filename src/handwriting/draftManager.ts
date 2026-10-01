@@ -15,6 +15,7 @@ let managerState: DraftManagerState = 'uninitialized';
 let currentDraft: ComposerDocument | null = null;
 let currentRevision = 0;
 let lastSavedRevision = 0;
+let saveQueue: Promise<boolean> = Promise.resolve(true);
 let saveTimer: any = null;
 let currentSaveStatus: DraftSaveStatus = 'idle';
 let loadError: string | null = null;
@@ -57,6 +58,7 @@ export function resetDraftManagerForTesting(): void {
   currentDraft = null;
   currentRevision = 0;
   lastSavedRevision = 0;
+  saveQueue = Promise.resolve(true);
   currentSaveStatus = 'idle';
   loadError = null;
   activeLoadPromise = null;
@@ -142,18 +144,9 @@ Notes for midterm:
         loadError = null;
         notify();
 
-        try {
-          await saveActiveDraft(freshDraft);
-          lastSavedRevision = 1;
-          currentSaveStatus = 'idle';
-          notify();
-        } catch (saveErr: any) {
-          // Retain new draft in memory, show unsaved/error state, support retry
-          currentSaveStatus = 'error';
-          notify();
-        }
+        await executeDraftSave(currentRevision);
 
-        return { status: 'not_found' as const, draft: freshDraft };
+        return { status: 'not_found' as const, draft: currentDraft! };
       }
 
       // Load error: preserve storage, do NOT write default draft, set load_error state
@@ -187,6 +180,8 @@ Notes for midterm:
 export async function retryDraftLoad(
   fallbackProfileId = ''
 ): Promise<{ status: 'found' | 'not_found' | 'error'; draft?: ComposerDocument; error?: string }> {
+  // A repeated retry must not discard edits or start a competing load.
+  if (activeLoadPromise || managerState === 'ready') return getOrLoadActiveDraft(fallbackProfileId);
   managerState = 'uninitialized';
   currentDraft = null;
   loadError = null;
@@ -290,15 +285,17 @@ export function flushDraftSave(): Promise<void> {
   return executeDraftSave(currentRevision).then(() => undefined);
 }
 
-async function executeDraftSave(revisionToSave: number): Promise<boolean> {
-  if (!currentDraft || managerState !== 'ready') return false;
-
-  const snapshot = currentDraft;
+function executeDraftSave(_requestedRevision: number): Promise<boolean> {
+  if (!currentDraft || managerState !== 'ready') return Promise.resolve(false);
+  const snapshot = structuredClone(currentDraft);
+  const revisionToSave = currentRevision;
   currentSaveStatus = 'saving';
   notify();
-
+  // Queue the writes themselves, not just their UI callbacks.
+  const operation = saveQueue.then(async () => {
   try {
-    await saveActiveDraft(snapshot);
+    if (revisionToSave > lastSavedRevision) await saveActiveDraft(snapshot);
+    lastSavedRevision = Math.max(lastSavedRevision, revisionToSave);
     // Ignore stale callbacks if a newer edit occurred in the meantime
     if (revisionToSave >= currentRevision) {
       lastSavedRevision = revisionToSave;
@@ -315,6 +312,9 @@ async function executeDraftSave(revisionToSave: number): Promise<boolean> {
     }
     return false;
   }
+  });
+  saveQueue = operation;
+  return operation;
 }
 
 export function subscribeDraft(

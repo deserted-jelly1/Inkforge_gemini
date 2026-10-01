@@ -98,7 +98,11 @@ export const HandwritingLab: React.FC = () => {
       setActiveProfileId(initialActiveId);
 
       // Initialize draft safely through draftManager
-      await getOrLoadActiveDraft(initialActiveId);
+      const loadedDraft = await getOrLoadActiveDraft(initialActiveId);
+      const savedProfileId = loadedDraft.draft?.profileId;
+      if (savedProfileId && loadedProfiles.some((p) => p.id === savedProfileId)) {
+        setActiveProfileId(savedProfileId);
+      }
 
       setIsLoaded(true);
     } catch (err: any) {
@@ -161,12 +165,11 @@ export const HandwritingLab: React.FC = () => {
   }, []);
 
   const handleRetryFailedProfileOp = (op: FailedProfileOp) => {
-    if (op.operation === 'save' || op.operation === 'rename' || op.operation === 'import') {
+    if (op.operation === 'save' || op.operation === 'rename' || op.operation === 'import' || op.operation === 'create') {
       if (op.unsavedProfile) {
+        handleDismissFailedOp(op.key);
         handleUpdateProfile(op.unsavedProfile);
       }
-    } else if (op.operation === 'create') {
-      handleCreatePersonalProfile(op.createName);
     } else if (op.operation === 'delete') {
       if (op.profileId) {
         handleDeleteProfile(op.profileId);

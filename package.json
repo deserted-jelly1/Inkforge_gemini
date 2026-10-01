@@ -7,7 +7,7 @@
     "dev": "vite --port 3000 --host 0.0.0.0",
     "build": "tsc && vite build",
     "lint": "tsc --noEmit",
-    "test": "tsx --test src/tests/regression.test.ts",
+    "test": "tsx --test src/tests/*.test.ts",
     "preview": "vite preview --port 3000"
   },
   "dependencies": {
@@ -24,6 +24,7 @@
     "@types/react": "^19.0.10",
     "@types/react-dom": "^19.0.4",
     "@vitejs/plugin-react": "^4.3.4",
+    "fake-indexeddb": "^6.2.5",
     "tailwindcss": "^4.0.9",
     "tsx": "^4.23.15",
     "typescript": "^5.7.3",

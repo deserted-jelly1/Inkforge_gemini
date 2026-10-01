@@ -126,7 +126,9 @@ export function migrateProfile(profile: HandwritingProfile): {
   const cleanedGlyphs: Record<string, CharacterSample[]> = {};
 
   for (const [char, samples] of Object.entries(profile.glyphs)) {
-    if (!Array.isArray(samples)) continue;
+    if (!Array.isArray(samples)) {
+      throw new Error(`Cannot migrate malformed samples for "${char}". Original profile has been preserved.`);
+    }
 
     const preservedSamples: CharacterSample[] = [];
 
@@ -214,7 +216,7 @@ export async function listProfiles(): Promise<LoadProfilesResult> {
 
         // Attach transaction lifecycle handlers upfront
         tx.oncomplete = () => {
-          safeResolve({ status: 'found', profiles: migratedList });
+          safeResolve(migratedList.length ? { status: 'found', profiles: migratedList } : { status: 'empty' });
         };
 
         tx.onerror = () => {
@@ -242,27 +244,23 @@ export async function listProfiles(): Promise<LoadProfilesResult> {
           try {
             const rawProfiles = (req.result as HandwritingProfile[]) || [];
             if (rawProfiles.length === 0) {
-              safeResolve({ status: 'empty' });
               return;
             }
 
             for (const p of rawProfiles) {
-              try {
                 const { profile: cleanP, migrated, backupToSave } = migrateProfile(p);
                 migratedList.push(cleanP);
                 if (migrated) {
-                  store.put(cleanP);
                   if (backupToSave) {
                     backupStore.put(backupToSave);
                   }
+                  store.put(cleanP);
                 }
-              } catch (migErr) {
-                console.error('Error migrating individual profile:', migErr);
-                // Preserve malformed or ambiguous original data for recovery rather than discarding
-                migratedList.push(p);
-              }
             }
           } catch (innerErr: any) {
+            // Synchronous put/validation failures do not automatically abort IDB.
+            // Explicitly roll back every queued migration and backup write.
+            tx.abort();
             safeResolve({
               status: 'error',
               error: innerErr?.message || 'Error processing loaded profiles.',
